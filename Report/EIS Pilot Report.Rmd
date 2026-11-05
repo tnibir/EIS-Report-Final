@@ -1,0 +1,1267 @@
+---
+title: "Spatial Analysis of Workers’ Road Accident Hotspots in Bangladesh to Inform Safety Measures: Evidence from the Employment Injury Scheme Pilot Programme"
+author:
+- "Tasbiul Islam Nibir\\\nResearch \\& Documentation Officer\\\nFunded by GIZ\n"
+- "Faruque Hasan\\\nJunior MIS Specialist, EIS-PSU\\\nFunded by ILO\n"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  word_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+    reference_docx: word-reference.docx
+    pandoc_args: ["--lua-filter=word-tables.lua"]
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+    keep_tex: false
+    latex_engine: pdflatex
+toc-title: Contents
+classoption: titlepage
+fontsize: 11pt
+geometry: margin=0.82in
+params:
+  risk_radius_m: 1000
+  project_data_dir: null
+header-includes:
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{float}
+- \newcommand{\keepspace}[1]{\par\ifdim\dimexpr\pagegoal-\pagetotal\relax<#1\relax\newpage\fi}
+- \usepackage{caption}
+- \captionsetup{font=small,labelfont=bf}
+- \renewcommand{\arraystretch}{1.18}
+- \setlength{\tabcolsep}{4pt}
+- \usepackage{xcolor}
+- \definecolor{RiskRed}{HTML}{A51C30}
+- \usepackage{fancyhdr}
+- \setlength{\headheight}{14pt}
+- \pagestyle{fancy}
+- "\\fancyhead[L]{Workers’ Road Accident Hotspots in Bangladesh}"
+- \fancyhead[R]{Nibir and Hasan}
+- \fancyfoot[C]{\thepage}
+---
+```{r setup, include=FALSE}
+non_latex <- !knitr::is_latex_output()
+
+knitr::opts_chunk$set(
+  echo = FALSE, warning = FALSE, message = FALSE,
+  fig.pos = "H", dpi = 300, dev = if (non_latex) "png" else "cairo_pdf",
+  fig.width = 7.2, fig.height = 5.2, out.width = "100%"
+)
+if (!non_latex) knitr::opts_chunk$set(fig.align = "center")
+
+## Required packages
+required_packages <- c(
+  "rmarkdown", "sf", "dplyr", "readr", "ggplot2", "knitr",
+  "scales", "maptiles", "terra", "stringr", "tidyr"
+)
+missing_pkg <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (!requireNamespace("arrow", quietly = TRUE) && !requireNamespace("nanoparquet", quietly = TRUE)) {
+  missing_pkg <- c(missing_pkg, "nanoparquet")
+}
+if (length(missing_pkg)) stop("Install required packages: ", paste(missing_pkg, collapse = ", "))
+
+library(sf); library(dplyr); library(readr); library(ggplot2)
+library(knitr); library(scales); library(maptiles); library(terra); library(stringr); library(tidyr)
+
+## Word does not number tables and figures on its own, so number them here
+if (non_latex) {
+  word_table_n <- 0L
+  kable <- function(x, ..., format = NULL, align = NULL, caption = NULL) {
+    word_table_n <<- word_table_n + 1L
+    out <- knitr::kable(x, format = "pipe", caption = paste0("**Table ", word_table_n, ":** ", caption), ...)
+    # Column widths follow the dashes under the header: keep each column wide enough for its longest word
+    cells <- rbind(names(x), as.matrix(format(as.data.frame(x), trim = TRUE)))
+    widths <- apply(cells, 2, function(col) {
+      max(max(nchar(unlist(strsplit(col, " ")))) + 4, min(max(nchar(col)), 45))
+    })
+    rule <- grep("^\\|[-:|]+\\|$", out)[1]
+    ends <- strsplit(gsub("^\\||\\|$", "", out[rule]), "|", fixed = TRUE)[[1]]
+    out[rule] <- paste0("|", paste0(ifelse(startsWith(ends, ":"), ":", "-"), strrep("-", widths),
+                                    ifelse(endsWith(ends, ":"), ":", "-"), collapse = "|"), "|")
+    out
+  }
+  word_figure_n <- 0L
+  knitr::opts_hooks$set(fig.cap = function(options) {
+    word_figure_n <<- word_figure_n + 1L
+    options$fig.cap <- paste0("**Figure ", word_figure_n, ":** ", options$fig.cap)
+    options
+  })
+}
+
+## Resolve project root from the Rmd file location
+input_file <- knitr::current_input(dir = TRUE)
+if (is.null(input_file) || !nzchar(input_file)) input_file <- "EIS Pilot Report.Rmd"
+project_root <- normalizePath(dirname(input_file), winslash = "/", mustWork = TRUE)
+
+## Source the road-risk helper functions
+# R/road_risk_analysis.R defines the functions used to link accidents to roads:
+#   is_drivable_highway()      - keeps OSM roads that carry vehicles
+#   road_class_priority()      - ranks road types (used inside the matcher)
+#   normalise_corridor_text()  - cleans road refs/names (used inside the summary)
+#   match_accidents_to_roads() - nearest-road match with a confidence label
+#   summarise_road_burden()    - accident counts per road corridor
+# See that file for a full description of each function.
+analysis_script <- file.path(project_root, "R", "road_risk_analysis.R")
+if (!file.exists(analysis_script)) stop("Required analysis script not found: ", analysis_script)
+source(analysis_script, local = knitr::knit_global())
+
+## Ensure Pandoc is discoverable in diverse execution environments
+if (!rmarkdown::pandoc_available()) {
+  for (pc in c(
+    "C:/Program Files/RStudio/resources/app/bin/quarto/bin/tools",
+    "C:/Program Files/Positron/resources/app/quarto/bin/tools"
+  )) {
+    if (file.exists(file.path(pc, "pandoc.exe"))) { Sys.setenv(RSTUDIO_PANDOC = pc); break }
+  }
+}
+
+## Validate the risk-radius parameter
+radius_m <- as.numeric(params$risk_radius_m)
+if (!is.finite(radius_m) || radius_m <= 0) stop("risk_radius_m must be a positive number.")
+
+## Resolve data directory (supports absolute or project-relative paths)
+configured_data_dir <- params$project_data_dir
+if (is.null(configured_data_dir) || is.na(configured_data_dir) || !nzchar(configured_data_dir)) {
+  configured_data_dir <- NA_character_
+}
+if (!is.na(configured_data_dir) && !grepl("^([A-Za-z]:[/\\\\]|/)", configured_data_dir)) {
+  configured_data_dir <- file.path(project_root, configured_data_dir)
+}
+data_candidates <- unique(c(configured_data_dir, file.path(project_root, "data")))
+data_candidates <- data_candidates[!is.na(data_candidates) & nzchar(data_candidates)]
+
+required_files <- c("points.parquet", "paths.parquet", "osm_roads.gpkg", "details_all_cases.csv")
+valid_dir <- vapply(data_candidates, function(x) all(file.exists(file.path(x, required_files))), logical(1))
+if (!any(valid_dir)) stop(
+  "Required data files not found. Expected: ", paste(required_files, collapse = ", "),
+  " under: ", paste(data_candidates, collapse = " | ")
+)
+data_dir <- normalizePath(data_candidates[which(valid_dir)[1]], winslash = "/", mustWork = TRUE)
+
+## ── Shared theme ────────────────────────────────────────────────────────────
+theme_report <- function() {
+  theme_minimal(base_size = 10.5) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 13, colour = "#263238"),
+      plot.subtitle = element_text(size = 9.5, colour = "#546E7A"),
+      legend.position = "bottom",
+      panel.grid.minor = element_blank(),
+      strip.text   = element_text(face = "bold"),
+      plot.caption = element_text(size = 8, colour = "#607D8B")
+    )
+}
+
+## ── Helper functions ─────────────────────────────────────────────────────────
+# Format a number for the text, e.g. 1000 -> "1,000"
+fmt_num <- function(x, digits = 0) format(round(x, digits), big.mark = ",", nsmall = digits, trim = TRUE)
+
+# Format a count as a share of a total, e.g. fmt_pct(71, 134) -> "53.0%"
+fmt_pct <- function(n, total, digits = 1) paste0(format(round(100 * n / total, digits), nsmall = digits), "%")
+
+# Expand a bounding box to achieve a target width-to-height ratio
+fit_bbox_aspect <- function(bb, target_ratio = 1.25) {
+  w <- bb["xmax"] - bb["xmin"]; h <- bb["ymax"] - bb["ymin"]
+  if (w / h < target_ratio) {
+    mid <- (bb["xmin"] + bb["xmax"]) / 2; hw <- h * target_ratio / 2
+    bb[c("xmin", "xmax")] <- c(mid - hw, mid + hw)
+  } else if (w / h > target_ratio) {
+    mid <- (bb["ymin"] + bb["ymax"]) / 2; hh <- w / target_ratio / 2
+    bb[c("ymin", "ymax")] <- c(mid - hh, mid + hh)
+  }
+  bb
+}
+
+# Add proportional padding to all four sides of a bounding box
+pad_bbox <- function(bb, fraction) {
+  xp <- (bb["xmax"] - bb["xmin"]) * fraction
+  yp <- (bb["ymax"] - bb["ymin"]) * fraction
+  bb[c("xmin", "xmax")] <- bb[c("xmin", "xmax")] + c(-xp, xp)
+  bb[c("ymin", "ymax")] <- bb[c("ymin", "ymax")] + c(-yp, yp)
+  bb
+}
+
+# Produce human-readable English corridor names from OSM road attributes.
+# Order of preference: the standard name of a known national highway (so the
+# N3 is always labelled the same way), then the English OSM name, then a
+# description built from the road reference and road type.
+readable_road_label <- function(ref, name, highway, osm_id) {
+  known_routes <- c(
+    N1 = "Dhaka to Chattogram Highway", N2 = "Dhaka to Sylhet Highway",
+    N3 = "Dhaka to Mymensingh Highway", N4 = "Joydebpur to Jamalpur Highway",
+    N5 = "Dhaka to Aricha Highway"
+  )
+  road_types <- c(
+    motorway = "motorway", trunk = "trunk road", primary = "primary road",
+    secondary = "secondary road", tertiary = "tertiary road",
+    residential = "residential road", service = "service road",
+    unclassified = "local road", motorway_link = "motorway link",
+    trunk_link = "trunk link", primary_link = "primary link"
+  )
+  mapply(function(route_ref, road_name, road_class, way_id) {
+    vals <- trimws(c(route_ref, road_name, road_class))
+    vals[vals == ""] <- NA_character_
+    route_ref <- vals[1]; road_name <- vals[2]
+    road_class <- strsplit(dplyr::coalesce(vals[3], "local"), ";", fixed = TRUE)[[1]][1]
+    readable_name <- !is.na(road_name) && grepl("[A-Za-z]", road_name) &&
+      !grepl("<U\\+[0-9A-Fa-f]{4,6}>", road_name)
+    label <- if (!is.na(route_ref) && route_ref %in% names(known_routes)) {
+      unname(known_routes[route_ref])
+    } else if (readable_name) {
+      gsub("\\s+-\\s+", " to ", road_name)
+    } else {
+      type_label <- dplyr::coalesce(unname(road_types[road_class]), "local road")
+      if (!is.na(route_ref) && grepl("^N[0-9]+$", route_ref))      paste("National highway", route_ref)
+      else if (!is.na(route_ref) && grepl("^R[0-9]+$", route_ref)) paste("Regional road", route_ref)
+      else if (!is.na(route_ref))                                    paste(route_ref, type_label)
+      else                                                            paste("Unnamed", type_label)
+    }
+    if (!is.na(route_ref) && !grepl(route_ref, label, fixed = TRUE)) label <- paste0(label, " (", route_ref, ")")
+    if (nchar(label) > 60) paste0(substr(label, 1, 57), "...") else label
+  }, ref, name, highway, osm_id, USE.NAMES = FALSE)
+}
+
+## ── Load spatial data ────────────────────────────────────────────────────────
+# GPS points and paths are stored as plain-column Parquet files (geometry is
+# stored as WKT text in Geometry_WKT, not as a native GeoParquet geometry).
+# We therefore read them with arrow or nanoparquet – neither requires
+# a GDAL Arrow/Parquet driver – and reconstruct sf objects later via
+# st_as_sf(wkt = "Geometry_WKT", …) where needed.
+read_parquet_file <- function(path) {
+  if (requireNamespace("arrow", quietly = TRUE)) return(arrow::read_parquet(path))
+  tibble::as_tibble(as.data.frame(nanoparquet::read_parquet(path), check.names = FALSE))
+}
+points_raw <- read_parquet_file(file.path(data_dir, "points.parquet"))
+paths_raw  <- read_parquet_file(file.path(data_dir, "paths.parquet"))
+roads      <- st_read(file.path(data_dir, "osm_roads.gpkg"), quiet = TRUE)
+case_details <- read.csv(file.path(data_dir, "details_all_cases.csv"),
+                         stringsAsFactors = FALSE, check.names = FALSE, fileEncoding = "UTF-8-BOM")
+
+# Validate required columns. Source identifies Commuting versus RTA records;
+# Source_File (minus ".kmz") is the map_key that matches `File ID` in the case details.
+for (col in c("Source", "Source_File", "KML_Layer", "Feature_ID", "Geometry_WKT")) {
+  if (!col %in% names(points_raw)) stop("points.parquet missing column: ", col)
+}
+for (col in c("Source", "Source_File", "Name", "Path Key", "Geometry_WKT")) {
+  if (!col %in% names(paths_raw)) stop("paths.parquet missing required column: ", col)
+}
+if (!"File ID" %in% names(case_details)) stop("details_all_cases.csv missing column: File ID")
+for (col in c("osm_id", "highway", "ref", "name", "name_bn")) {
+  if (!col %in% names(roads)) stop("osm_roads.gpkg missing column: ", col)
+}
+if (is.na(sf::st_crs(roads)))  stop("osm_roads.gpkg has no CRS.")
+if (nrow(points_raw) == 0L)    stop("points.parquet contains no records.")
+if (nrow(paths_raw)  == 0L)    stop("paths.parquet contains no records.")
+if (nrow(roads)      == 0L)    stop("osm_roads.gpkg contains no road features.")
+
+# Standardize the Type labels without discarding other labels.
+normalise_type <- function(x) {
+  x <- stringr::str_to_lower(stringr::str_trim(as.character(x)))
+  dplyr::case_when(
+    x %in% c("commuting", "commute", "commuting accident") ~ "Commuting",
+    x %in% c("rta", "road traffic accident", "on-duty rta", "on duty rta") ~ "RTA",
+    is.na(x) | x == "" ~ "Unknown",
+    TRUE ~ stringr::str_to_title(x)
+  )
+}
+
+## ── Build accident and route sf objects ──────────────────────────────────────
+make_map_key <- function(x) sub("\\.kmz$", "", trimws(as.character(x)), ignore.case = TRUE)
+
+# Some KMZ file names differ from the intake `File ID` (year prefix differs, e.g.
+# 2024.EIS.000039 vs 2025.EIS.000039, or the file is named after the factory).
+# Resolve each GPS key to an intake File ID: exact match, then the unique EIS
+# serial number, then the manual aliases below.
+map_key_aliases <- c("crystal martin" = "2026.EIS.000151", "impress fashion" = "2026.EIS.000157")
+resolve_map_key <- function(key, file_ids) {
+  serial  <- function(x) sub("^.*EIS\\.", "", x)
+  by_serial <- file_ids[match(serial(key), serial(file_ids))]
+  by_serial[!grepl("EIS\\.", key)] <- NA_character_
+  dplyr::coalesce(file_ids[match(key, file_ids)], by_serial, unname(map_key_aliases[tolower(key)]), key)
+}
+case_details$`File ID` <- make_map_key(case_details$`File ID`)
+
+# District names are typed by hand in the intake form and use several
+# spellings (e.g. "Chittagong"/"Chattogram", "Narayangonj"/"Narayanganj").
+# Map them to one official spelling so tables group them correctly.
+normalise_district <- function(x) {
+  x <- stringr::str_to_title(stringr::str_squish(as.character(x)))
+  dplyr::recode(x, "Chittagong" = "Chattogram", "Narayangonj" = "Narayanganj",
+                "Hobigonj" = "Habiganj", "Comilla" = "Cumilla")
+}
+case_details$`District (Accident)` <- normalise_district(case_details$`District (Accident)`)
+case_details$`District (Factory)`  <- normalise_district(case_details$`District (Factory)`)
+
+# Each journey (KML layer) holds three markers in order A (start), B (accident),
+# C (destination). The trailing _n of Feature_ID gives that order, so the second
+# point of each layer is the accident location.
+accidents <- points_raw |>
+  mutate(
+    Type    = normalise_type(Source),
+    map_key = resolve_map_key(make_map_key(Source_File), case_details$`File ID`),
+    File    = map_key,
+    Layer   = KML_Layer,
+    marker_order = suppressWarnings(as.integer(sub(".*_([0-9]+)$", "\\1", Feature_ID)))
+  ) |>
+  group_by(map_key, Layer) |>
+  arrange(marker_order, .by_group = TRUE) |>
+  filter(n() >= 3, row_number() == 2) |>
+  ungroup() |>
+  st_as_sf(wkt = "Geometry_WKT", crs = 4326) |>
+  st_zm() |>
+  (\(x) x[!st_is_empty(x), ])() |>
+  left_join(case_details |> rename(map_key = `File ID`),
+            by = "map_key")
+
+# Drop accident points that fall outside Bangladesh. These come from mapping
+# errors in the KMZ files (e.g. a route-planner search that found a factory of
+# the same name abroad). The case stays in the intake (EIS) analysis; only its
+# map location is excluded. The box below is a generous outline of Bangladesh.
+bd_bbox <- c(xmin = 88.0, ymin = 20.5, xmax = 92.8, ymax = 26.7)
+acc_xy  <- st_coordinates(accidents)
+inside_bd <- acc_xy[, 1] >= bd_bbox["xmin"] & acc_xy[, 1] <= bd_bbox["xmax"] &
+             acc_xy[, 2] >= bd_bbox["ymin"] & acc_xy[, 2] <= bd_bbox["ymax"]
+outside_bd <- accidents[!inside_bd, ] |> st_drop_geometry() |>
+  transmute(map_key, Layer, lon = acc_xy[!inside_bd, 1], lat = acc_xy[!inside_bd, 2])
+accidents <- accidents[inside_bd, ]
+
+if (nrow(accidents) == 0L) stop("No accident (B) points found in points.parquet.")
+
+# GPS coverage: not every intake case has a mapped KMZ.
+gps_cases_n   <- n_distinct(accidents$map_key)
+intake_cases_n <- n_distinct(case_details$`File ID`)
+gps_unmatched <- setdiff(accidents$map_key, case_details$`File ID`)
+intake_mapped_n <- length(intersect(accidents$map_key, case_details$`File ID`))
+multi_journey_keys <- names(which(table(accidents$map_key) > 1))
+
+# One row per route; `Path Key` is the unique route ID.
+paths_raw <- paths_raw |>
+  mutate(
+    Type = normalise_type(Source),
+    map_key = resolve_map_key(make_map_key(Source_File), case_details$`File ID`),
+    File = map_key,
+    Layer = KML_Layer,
+    `Path Name` = Name,
+    Original_Route_ID = as.character(`Path Key`)
+  )
+
+# Routes belonging to an excluded (outside Bangladesh) journey are dropped too
+routes <- st_as_sf(paths_raw, wkt = "Geometry_WKT", crs = 4326) |>
+  st_zm() |>
+  (\(x) x[!st_is_empty(x), ])() |>
+  filter(!paste(map_key, Layer) %in% paste(outside_bd$map_key, outside_bd$Layer))
+
+if (is.na(sf::st_crs(routes)) || nrow(routes) == 0L) {
+  stop("paths.parquet WKT geometries are invalid or empty.")
+}
+
+## ── Project to metres (UTM Zone 46N) for distance calculations ───────────────
+# EPSG 32646 gives accurate metre-based results across Bangladesh.
+# All visual maps are kept in WGS 84 for geographic clarity.
+analysis_crs <- 32646
+accidents_m  <- st_transform(accidents, analysis_crs)
+routes_m     <- st_transform(routes,    analysis_crs)
+roads_m      <- st_transform(roads,     analysis_crs)
+
+## ── Buffer each accident and merge overlapping buffers into zones ─────────────
+buffers_m <- st_buffer(accidents_m, radius_m)
+links     <- st_intersects(buffers_m)
+
+# Connected-component labelling: touching buffers share the same zone ID
+component    <- rep(NA_integer_, length(links))
+component_id <- 0L
+for (seed in seq_along(links)) {
+  if (!is.na(component[seed])) next
+  component_id       <- component_id + 1L
+  queue              <- seed
+  component[seed]    <- component_id
+  while (length(queue)) {
+    current <- queue[1]; queue <- queue[-1]
+    unseen  <- links[[current]][is.na(component[links[[current]]])]
+    if (length(unseen)) { component[unseen] <- component_id; queue <- c(queue, unseen) }
+  }
+}
+# Renumber zones by density so Zone 1 holds the most cases (ties keep discovery order)
+zone_rank <- order(-tabulate(component), seq_len(max(component)))
+component <- match(component, zone_rank)
+buffers_m$zone_id   <- component
+accidents_m$zone_id <- component
+
+zones_m <- buffers_m |>
+  group_by(zone_id) |>
+  summarise(accident_count = n(), .groups = "drop") |>
+  mutate(risk_class = case_when(
+    accident_count >= 8 ~ "Critical",
+    accident_count >= 5 ~ "Very high",
+    accident_count >= 3 ~ "High",
+    accident_count >= 2 ~ "Elevated",
+    TRUE                ~ "Observed"
+  ))
+
+## ── Route proximity and road matching ────────────────────────────────────────
+# Group to one feature per route before calculating route counts,
+# route lengths, and route-to-accident proximity. Segment geometries remain
+# available in routes_m for mapping.
+route_groups_m <- routes_m |>
+  group_by(Original_Route_ID, Type, File, Layer, `Path Name`) |>
+  summarise(.groups = "drop")
+
+# Every route passes its own accident point, so "nearby_accidents" is always at
+# least 1. "other_case_accidents" counts only accidents from OTHER case files,
+# which shows whether a worker's journey runs through a place where other
+# workers were also hurt.
+near_idx <- st_is_within_distance(route_groups_m, accidents_m, dist = radius_m)
+route_stats <- route_groups_m |>
+  mutate(
+    nearby_accidents     = lengths(near_idx),
+    other_case_accidents = mapply(function(idx, f) sum(accidents_m$File[idx] != f), near_idx, File),
+    route_length_km      = as.numeric(st_length(st_geometry(route_groups_m))) / 1000
+  )
+
+# match_accidents_to_roads() [R/road_risk_analysis.R]: assigns each accident to
+# the nearest drivable OSM road within 50 m and labels the match High / Lower /
+# Unmatched.
+matches     <- match_accidents_to_roads(accidents_m, roads_m)
+
+# summarise_road_burden() [R/road_risk_analysis.R]: groups OSM road pieces into
+# corridors (by ref, then name) and counts matched accidents on each one.
+road_burden <- summarise_road_burden(matches, roads_m) |>
+  mutate(road = readable_road_label(ref, name, highway, osm_ids))
+
+## ── Summary scalars used throughout the report ───────────────────────────────
+multi_zones      <- zones_m |> filter(accident_count >= 2) |> arrange(desc(accident_count), zone_id)
+top_zone_ids     <- head(multi_zones$zone_id, 6)
+
+# Hotspots mapped in detail: zones with more than 3 cases, densest first, max 10
+hotspot_min_cases <- 3
+hotspot_max_zones <- 10
+hotspot_zones <- multi_zones |> filter(accident_count > hotspot_min_cases) |> head(hotspot_max_zones)
+
+# Most frequent value, ignoring blanks
+top_value <- function(x) {
+  x <- x[!is.na(x) & nzchar(trimws(x))]
+  if (!length(x)) NA_character_ else names(sort(table(x), decreasing = TRUE))[1]
+}
+
+# Corridors with no OSM name or route number are never reported as a road
+is_named_road <- function(x) !is.na(x) & !grepl("^Unnamed", x)
+
+hotspot_table <- matches |>
+  filter(zone_id %in% hotspot_zones$zone_id) |>
+  mutate(road = ifelse(is.na(osm_id), NA_character_, readable_road_label(ref, name, highway, osm_id)),
+         road = ifelse(is_named_road(road), road, NA_character_)) |>
+  group_by(zone_id) |>
+  summarise(
+    Cases     = n(),
+    Commuting = sum(Type == "Commuting"),
+    RTA       = sum(Type == "RTA"),
+    `Main road` = top_value(road),
+    road_n    = sum(road == top_value(road), na.rm = TRUE),
+    District  = top_value(`District (Accident)`),
+    .groups = "drop"
+  ) |>
+  arrange(desc(Cases), zone_id) |>
+  rename(Zone = zone_id)
+study_extent     <- st_bbox(st_transform(accidents_m, 4326))
+overview_extent  <- pad_bbox(study_extent, 0.10)
+matched_n        <- sum(!is.na(matches$osm_id))
+high_conf_n      <- sum(matches$match_confidence == "High", na.rm = TRUE)
+lower_conf_n     <- sum(matches$match_confidence == "Lower", na.rm = TRUE)
+unmatched_n      <- sum(matches$match_confidence == "Unmatched", na.rm = TRUE)
+top_road         <- if (nrow(road_burden)) road_burden$road[1] else "No matched corridor"
+top_road_events  <- if (nrow(road_burden)) road_burden$recorded_accidents[1] else 0
+
+# Leading corridors for the road table and figure: the top ten, up to the last named road
+leading_roads <- road_burden |> st_drop_geometry() |> head(10) |> filter(is_named_road(road))
+tied_roads    <- road_burden |> st_drop_geometry() |> slice(-(1:10)) |>
+  filter(is_named_road(road), recorded_accidents == min(leading_roads$recorded_accidents))
+unnamed_cases_n <- sum(road_burden$recorded_accidents[!is_named_road(road_burden$road)])
+unmatched_rta_n <- sum(matches$match_confidence == "Unmatched" & matches$Type == "RTA")
+
+# Figures quoted in the text, so the wording stays correct when data change
+clustered_cases_n <- sum(multi_zones$accident_count)          # cases in zones of 2+
+single_zone_n     <- sum(zones_m$accident_count == 1)         # isolated cases
+routes_shared_n   <- sum(route_stats$other_case_accidents > 0) # routes near another case
+national_hwy_n    <- sum(road_burden$recorded_accidents[grepl("^N[0-9]+$", road_burden$ref)])
+top5_roads_n      <- sum(head(road_burden$recorded_accidents, 5))
+zone_class_n      <- function(cls) sum(zones_m$risk_class == cls)
+cluster_share     <- function(t) {
+  in_type <- accidents_m$Type == t
+  fmt_pct(sum(accidents_m$zone_id[in_type] %in% multi_zones$zone_id), sum(in_type), 0)
+}
+
+## Dot colours distinguish accident type; zoning treats all types alike.
+accident_type_fill <- c("Commuting" = "#D32F2F", "RTA" = "#6A1B9A", "Unknown" = "#546E7A")
+
+## ── Render a basemap-backed localized zone map ───────────────────────────────
+render_zone_map <- function(zid, custom_title = NULL) {
+  local_zone <- zones_m |> filter(zone_id == zid)
+  local_acc  <- accidents_m |> filter(zone_id == zid)
+  if (!nrow(local_zone) || !nrow(local_acc)) stop("zone_id ", zid, " not found in current data.")
+
+  frame      <- st_buffer(local_zone, 450)
+  # is_drivable_highway() [R/road_risk_analysis.R] hides footpaths and other
+  # non-vehicle ways so only the road network is drawn on the zone map
+  local_roads <- suppressWarnings(st_intersection(roads_m |> filter(is_drivable_highway(highway)), frame))
+  bb         <- fit_bbox_aspect(st_bbox(frame))
+  tile_cache <- file.path(project_root, "data", "maptiles_cache")
+  dir.create(tile_cache, recursive = TRUE, showWarnings = FALSE)
+
+  base_tiles   <- get_tiles(st_as_sfc(bb), provider = "Esri.WorldGrayCanvas",
+                            crop = TRUE, project = TRUE, cachedir = tile_cache, retina = FALSE)
+  tile_ext     <- terra::ext(base_tiles)
+  plot_title   <- if (!is.null(custom_title)) custom_title else paste0("Zone ", zid, ": ", local_zone$accident_count, " recorded cases")
+  ggplot() +
+    annotation_raster(as.raster(as.array(base_tiles) / 255),
+                      xmin = tile_ext$xmin, xmax = tile_ext$xmax,
+                      ymin = tile_ext$ymin, ymax = tile_ext$ymax) +
+    geom_sf(data = local_roads,
+            aes(linewidth = highway %in% c("motorway", "trunk", "primary")),
+            colour = "#546E7A", alpha = 0.85) +
+    geom_sf(data = local_zone, fill = "#FFCC80", colour = "#EF6C00", alpha = 0.35, linewidth = 0.4) +
+    geom_sf(data = local_acc,  aes(fill = Type), shape = 21, colour = "white", size = 3, stroke = 0.45) +
+    coord_sf(xlim = c(bb["xmin"], bb["xmax"]), ylim = c(bb["ymin"], bb["ymax"]), expand = FALSE) +
+    scale_linewidth_manual(values = c(`TRUE` = 0.9, `FALSE` = 0.4), guide = "none") +
+    scale_fill_manual(name = NULL, values = accident_type_fill, drop = TRUE) +
+    labs(
+      title    = plot_title,
+      subtitle = "Map extends 450 m beyond the connected analytical zone for context",
+      x = NULL, y = NULL,
+      caption  = paste0("Red points: commuting accidents; purple points: RTA; orange area: connected ", fmt_num(radius_m),
+                        " m buffers.\nBasemap tiles \u00a9 Esri (Esri, DeLorme, NAVTEQ). Roads \u00a9 OpenStreetMap contributors.")
+    ) +
+    theme_report() +
+    theme(axis.text = element_text(size = 7),
+          plot.title = element_text(face = "bold", size = 10.5, colour = "#263238"))
+}
+
+## ── EIS intake records: cleaning for the demographic analysis ───────────────
+# `d` holds every intake case (with or without GPS). Gender, age and transport
+# mode are typed by hand, so spelling variants are merged into one label each.
+age_max_plausible <- 70  # ages above this are treated as entry errors
+d <- case_details |>
+  mutate(
+    Gender = case_when(
+      str_to_lower(str_trim(Gender)) %in% c("m", "male")   ~ "Male",
+      str_to_lower(str_trim(Gender)) %in% c("f", "female") ~ "Female",
+      TRUE ~ str_to_title(str_trim(Gender))
+    ),
+    Age = suppressWarnings(as.numeric(Age)),
+    Age_band = cut(
+      ifelse(Age > age_max_plausible, NA, Age),
+      breaks = c(0, 18, 25, 35, 45, 55, 65, Inf),
+      labels = c("<18", "18–24", "25–34", "35–44", "45–54", "55–64", "65+"),
+      right  = FALSE
+    ),
+    # Order matters: "Cover Van"/"Pickup Van" are caught by "van" first, and
+    # "Padestrain"/"Padistian" are misspellings of Pedestrian.
+    Mode_clean = case_when(
+      str_detect(str_to_lower(Mode), "van")                  ~ "Van",
+      str_detect(str_to_lower(Mode), "easy")                 ~ "Easy Bike",
+      str_detect(str_to_lower(Mode), "motor")                ~ "Motorcycle",
+      str_detect(str_to_lower(Mode), "pedest|padest|padist") ~ "Pedestrian",
+      str_detect(str_to_lower(Mode), "cng")                  ~ "CNG",
+      str_detect(str_to_lower(Mode), "bus")                  ~ "Bus",
+      str_detect(str_to_lower(Mode), "vehicle")              ~ "Vehicle to Vehicle",
+      str_detect(str_to_lower(Mode), "other")                ~ "Others",
+      TRUE ~ Mode
+    )
+  )
+
+# Counts quoted in the text. `n_where()` counts intake cases matching a condition.
+n_where   <- function(cond) sum(cond, na.rm = TRUE)
+eis_n     <- nrow(d)
+is_comm   <- d$`Case Type` == "Commuting Accident"
+is_rta    <- d$`Case Type` == "On Duty RTA"
+female_n  <- n_where(d$Gender == "Female")
+male_n    <- n_where(d$Gender == "Male")
+comm_n    <- n_where(is_comm)
+rta_n     <- n_where(is_rta)
+death_n   <- n_where(d$Loss == "Death")
+disab_n   <- n_where(d$Loss == "Disability")
+comm_death_n <- n_where(is_comm & d$Loss == "Death")
+age_invalid_n <- n_where(d$Age > age_max_plausible)
+age_valid  <- d$Age[!is.na(d$Age) & d$Age <= age_max_plausible]
+mode_n <- function(m, cond = TRUE) n_where(d$Mode_clean == m & cond)
+age_n  <- function(bands) n_where(d$Age_band %in% bands)
+
+# The four districts with the most cases, e.g. "Gazipur, Dhaka, Chattogram and Narayanganj"
+top_d <- names(sort(table(d$`District (Accident)`), decreasing = TRUE))[1:4]
+top_d <- top_d[!is.na(top_d)]
+top_districts <- if (length(top_d) > 1) paste(paste(head(top_d, -1), collapse = ", "), "and", tail(top_d, 1)) else top_d
+
+# Study period, from the accident dates in the intake records
+accident_dates <- as.Date(d$`Date (Accident)`, "%m/%d/%Y")
+period_start <- format(min(accident_dates, na.rm = TRUE), "%B %Y")
+period_end   <- format(max(accident_dates, na.rm = TRUE), "%B %Y")
+```
+
+\newpage
+
+# Abstract
+
+This report examines where garment, textile and footwear workers in Bangladesh were killed or disabled in road accidents, and who those workers were. It uses `r eis_n` intake cases from the Employment Injury Scheme (EIS) pilot, with accidents dated from `r period_start` to `r period_end`. A total of `r nrow(accidents)` accident points could be mapped with the worker's journey route. A `r fmt_num(radius_m)` m circle was drawn around each point, and overlapping circles were grouped into one zone. This produced `r nrow(multi_zones)` zones with two or more points. They hold `r clustered_cases_n` of the `r nrow(accidents)` mapped points (`r fmt_pct(clustered_cases_n, nrow(accidents), 0)`). The road with the most points was **`r top_road`** (`r top_road_events`), and national highways together hold `r national_hwy_n` of the `r matched_n` points linked to a road.
+
+The intake records show that `r fmt_pct(death_n, eis_n, 0)` of the cases were deaths. Commuting accounted for `r fmt_pct(comm_n, eis_n, 0)` of cases, and `r fmt_pct(mode_n("Pedestrian"), eis_n, 0)` involved a worker on foot. `r if (female_n > 0 && n_where(d$Gender == 'Female' & !is_comm) == 0) 'Every case involving a woman was a commuting accident. ' else ''`The report describes the densest zones and sets out recommended actions. The zones show where cases are concentrated. They are not accident rates, because the number of people using each road is not known.
+
+**Keywords:** occupational road safety; worker accidents; spatial clustering; road corridor risk; gender disaggregation; collision types; GIS; Bangladesh
+
+# Introduction
+
+This report identifies where worker road accident cases recorded in the EIS pilot are concentrated. The aim is to help direct road-safety measures to the places with the most recorded cases.
+
+Road injuries are a leading cause of death worldwide. They caused an estimated 1.34 million deaths in 2023, and the mortality rate in low-income countries was about six times that in high-income countries (GBD 2023 Road Injuries Collaborators, 2026). In Bangladesh, pedestrians are involved in nearly 50% of fatal collisions, rising to around 65% in the Dhaka metropolitan area (Debnath et al., 2021). An earlier study reported that national highways account for about 47% of pedestrian fatalities in the country (Sarkar et al., 2011). A study of Bangladeshi crashes also found that the leading factors linked to injury severity were not the same on highway and non-highway roads (Sakib et al., 2025).
+
+Map-based methods have already been used to find crash concentrations on Bangladeshi roads. Khatun et al. (2024) used a severity index, kernel density estimation and hotspot analysis on the Kushtia-Jhenaidah highway (N704). Billah et al. (2026) identified 18 high-risk black spots among 69 crash-prone locations on the Dhaka-Mawa Expressway (N804). Each of these studies covers a single road. Commuting is also part of occupational road safety. In Spain, official reports recorded more commuting crashes than at-work crashes among occupational road injuries in every year from 2020 to 2024 (Sánchez-Toledo Ledesma and Fernández Laviada, 2026). Those figures describe Spain and may not apply to Bangladesh. This report uses a map-based approach across all mapped roads, for worker cases recorded in the EIS pilot.
+
+The records used here are **worker accident cases** from the EIS pilot. Bangladesh launched the pilot in June 2022 for the export-oriented garment sector, with technical support from the ILO and GIZ. The cases cover two situations: road traffic accidents (RTA) that happened while a worker was travelling for their job (on duty), and commuting accidents that happened on the way to or from the workplace. The report addresses four questions:
+(1) where do accident cases cluster together;
+(2) which roads and journey routes have the most cases;
+(3) who is affected, in terms of gender and age; and
+(4) how were workers travelling when the accident happened, and does this differ between commuting and on-duty cases?
+
+## Study Scope
+
+This is a descriptive study. Traffic counts, the size of the workforce in each area and the frequency of each trip are not available, so true risk rates cannot be calculated. The data can show where cases are concentrated and who was affected. The gender, age and transport mode figures come from the EIS intake dataset (`details_all_cases.csv`) and describe the reported cases only. Every case in the dataset ended in either death or disability, so minor injuries are not included.
+
+## Key Terms
+
+- **Case:** one worker recorded in the EIS data.
+- **Commuting accident:** an accident on the way between home and the workplace.
+- **On-duty RTA:** a road traffic accident that happened while the worker was travelling for their job.
+- **Zone:** a group of accidents whose `r fmt_num(radius_m)` m circles overlap, so each accident lies within `r fmt_num(2 * radius_m)` m of at least one other accident in the group. A zone can hold a single case.
+- **Cluster:** a zone with two or more cases.
+- **Road match:** the road an accident point was linked to. A *high-confidence* match means the point lies close to a single road. A *lower-confidence* match means it lies further away or near more than one road, for example at a junction.
+
+# Materials and Methods
+
+## Data and Case Definition
+
+Four data sources were used: `points.parquet` for journey points and accident locations, `paths.parquet` for the route lines, the EIS intake records (`details_all_cases.csv`), and a project OpenStreetMap extract (`osm_roads.gpkg`) to identify roads. In the original case files, each journey was mapped with three markers in order: A for the starting point, B for the accident point, and C for the destination. The middle (**B**) marker of each journey was treated as the accident. The `Source` field separates commuting and on-duty RTA records. Both types go through the same zoning and road-matching steps and differ only in colour on the maps.
+
+GPS records are linked to the intake records by case file ID. Of the `r eis_n` intake cases, `r intake_mapped_n` have a usable mapped location. The other `r eis_n - intake_mapped_n` appear only in the demographic and transport analysis. `r if (length(gps_unmatched)) paste0('A further ', length(gps_unmatched), ' mapped case files have no matching intake record, so they appear only in the spatial analysis. ') else ''`Records with invalid coordinates or empty route lines were removed before mapping. `r if (length(multi_journey_keys)) paste0('Case file ', paste(multi_journey_keys, collapse = ', '), ' holds two mapped journeys, one under each journey type. Both are shown as recorded, which gives ', nrow(accidents), ' accident points from ', n_distinct(accidents$map_key), ' case files.') else ''`
+
+Table 1 summarises the mapped data. *Mapped accident points* are the B markers, and *journey routes* are the routes drawn for those journeys. *Road-matched points* lie within 50 m of a road in the OpenStreetMap extract. The remaining `r unmatched_n` points have no road in the extract within 50 m, and `r unmatched_rta_n` of them are on-duty RTA records (see Limitations). Table 2 splits the mapped points by journey type.
+
+```{r data-summary, results='asis'}
+summary_table <- data.frame(
+  Indicator = c(
+    "Mapped accident points", "Journey routes",
+    "Distinct case files with GPS", "Zones with two or more points", "Road-matched points",
+    "High-confidence road matches"
+  ),
+  Result = c(nrow(accidents), nrow(route_stats), n_distinct(accidents$File),
+             nrow(multi_zones), matched_n, high_conf_n)
+  # matched_n / high_conf_n come from match_accidents_to_roads() [R file]
+)
+kable(summary_table, booktabs = TRUE, position = "H", caption = "Analytical dataset and matching summary.")
+```
+
+```{r type-summary, results='asis'}
+type_summary <- accidents |>
+  st_drop_geometry() |>
+  count(Type, name = "Accident points") |>
+  full_join(
+    route_stats |>
+      st_drop_geometry() |>
+      count(Type, name = "Original routes"),
+    by = "Type"
+  ) |>
+  mutate(
+    `Accident points` = tidyr::replace_na(`Accident points`, 0L),
+    `Original routes` = tidyr::replace_na(`Original routes`, 0L)
+  ) |>
+  arrange(match(Type, c("Commuting", "RTA")), Type)
+
+kable(type_summary, booktabs = TRUE, position = "H",
+      caption = "Accident points and original routes by journey type.")
+```
+
+## Spatial Analysis
+
+All distances were measured in metres using EPSG:32646 (UTM Zone 46N), a map projection that measures distance accurately across Bangladesh. A `r fmt_num(radius_m)` m circle was drawn around every accident. Where circles touched or overlapped, they were joined into one zone, and any zone containing two or more cases was treated as a local cluster. The radius is only a way of grouping nearby cases. It does not mean an accident affected that whole area.
+
+Each zone was given a priority class based on the number of cases it holds:
+
+```{r class-table, results='asis'}
+data.frame(
+  `Priority class` = c("Critical", "Very high", "High", "Elevated", "Observed"),
+  `Cases in zone`  = c("8 or more", "5 to 7", "3 to 4", "2", "1"),
+  `Zones in current data` = sapply(c("Critical", "Very high", "High", "Elevated", "Observed"), zone_class_n),
+  check.names = FALSE
+) |>
+  kable(booktabs = TRUE, position = "H", row.names = FALSE,
+        caption = "Zone priority classes and the number of zones in each.")
+```
+
+Each accident was then linked to a road. The matching step (the `match_accidents_to_roads()` function in `R/road_risk_analysis.R`) finds the nearest OpenStreetMap road that carries vehicles, within 50 m. Footpaths and cycle tracks are ignored. If the nearest road is within 30 m and no other road is about as close, the match is marked high confidence. If the nearest road is 30--50 m away, or another road is within 5 m of the same distance (as at a junction), it is marked lower confidence. Where roads compete in this way, the more important road (for example a highway over a service lane) is chosen. Short OpenStreetMap road pieces that share the same route number or name are then combined into one corridor, and the cases on each corridor are counted.
+
+## Prioritisation Logic
+
+Zone priority classes rest on case counts alone. Road counts, worker routes passing through a zone and the confidence of road matches give supporting context when comparing places. The recommendations are kept general because the data do not record how each crash happened, vehicle speeds, traffic volumes, shift times or the condition of the site.
+
+# Results
+
+## Overall Spatial Pattern
+
+```{r overview-map, fig.cap="Geographic distribution of recorded worker accident cases and connected zones."}
+zones_wgs   <- st_transform(zones_m, 4326)
+routes_wgs  <- st_transform(routes_m, 4326)
+
+overview_tiles <- get_tiles(
+  st_as_sfc(overview_extent), provider = "Esri.WorldGrayCanvas", zoom = 7,
+  crop = TRUE, project = TRUE,
+  cachedir = file.path(project_root, "data", "maptiles_cache"), retina = FALSE
+)
+ot_ext <- terra::ext(overview_tiles)
+
+ggplot() +
+  annotation_raster(as.raster(as.array(overview_tiles) / 255),
+                    xmin = ot_ext$xmin, xmax = ot_ext$xmax,
+                    ymin = ot_ext$ymin, ymax = ot_ext$ymax) +
+  geom_sf(data = routes_wgs, aes(colour = Type), linewidth = 0.25, alpha = 0.45) +
+  geom_sf(data = zones_wgs,  fill = "#FFCC80", colour = "#EF6C00",
+          linewidth = 0.35, alpha = 0.32) +
+  geom_sf(data = accidents,  aes(fill = Type),
+          shape = 21, colour = "white", size = 1.8, stroke = 0.3) +
+  scale_colour_manual(
+    name = "Routes",
+    values = c("Commuting" = "#1565C0", "RTA" = "#00897B", "Unknown" = "#546E7A")
+  ) +
+  scale_fill_manual(name = "Accidents", values = accident_type_fill) +
+  guides(
+    colour = guide_legend(override.aes = list(linewidth = 0.7, alpha = 0.8)),
+    fill   = guide_legend(override.aes = list(size = 2.5))
+  ) +
+  scale_x_continuous(breaks = 89:92) +
+  coord_sf(xlim = c(overview_extent["xmin"], overview_extent["xmax"]),
+           ylim = c(overview_extent["ymin"], overview_extent["ymax"]), expand = FALSE) +
+  labs(title    = "Worker accident locations and analytical zones",
+       subtitle = "Worker journeys and zones of connected accident buffers",
+       x = NULL, y = NULL,
+       caption  = "Source: supplied worker accident and route records; author analysis.\nBasemap tiles \u00a9 Esri (Esri, DeLorme, NAVTEQ). Roads \u00a9 OpenStreetMap contributors.") +
+  theme_report() +
+  theme(plot.title.position = "plot", plot.caption.position = "plot",
+        plot.caption = element_text(hjust = 0.5))
+```
+
+Figure 1 shows every mapped accident point (dots), the journey routes (lines) and the zones formed by overlapping `r fmt_num(radius_m)` m circles (orange). In the intake records, the districts with the most cases are `r top_districts`. On the map, `r clustered_cases_n` of the `r nrow(accidents)` accident points (`r fmt_pct(clustered_cases_n, nrow(accidents), 0)`) fall in a zone shared with at least one other point, and `r single_zone_n` are isolated.
+
+When reading the map, look at the number of points in each zone, not the size of the orange area. A long, thin zone simply means the points are strung out along a road.
+
+In total, `r routes_shared_n` of the `r nrow(route_stats)` journey routes (`r fmt_pct(routes_shared_n, nrow(route_stats), 0)`) pass within `r fmt_num(radius_m)` m of an accident from a *different* case file.
+
+## Accident-Prone Roads
+
+The table below lists the leading road corridors by number of road-matched points. Only corridors with an English road name or route number in OpenStreetMap are shown. *High confidence* and *lower confidence* show how certain the road match is for those cases (see Section 3.2). *Share* is the corridor's percentage of all `r matched_n` road-matched cases.
+
+```{r road-table, results='asis'}
+# road_burden is built by summarise_road_burden() [R/road_risk_analysis.R]
+road_table <- leading_roads |>
+  transmute(
+    `Road/corridor`       = road,
+    `Cases`               = recorded_accidents,
+    `High confidence`     = high_confidence_accidents,
+    `Lower confidence`    = lower_confidence_accidents,
+    `Share (%)`           = round(share_of_matched_pct, 1)
+  )
+kable(road_table, booktabs = TRUE, position = "H",
+      caption = "Named road corridors with the most recorded worker accident cases.")
+```
+
+```{r road-chart-title, results='asis'}
+road_chart_title <- "Cases concentrated on a few corridors"
+if (non_latex) {
+  cat("\n\n::: {custom-style=\"Figure Title\"}\n", road_chart_title, "\n:::\n\n", sep = "")
+} else {
+  cat("\n\n\\begin{center}\\vspace{0.6em}\\textbf{", road_chart_title, "}\\end{center}\\nopagebreak\n\n", sep = "")
+}
+```
+
+```{r road-chart, fig.height=4.2, fig.width=6.5, out.width="85%", fig.cap="Leading named road corridors ranked by road-matched worker accident cases."}
+road_table |>
+  mutate(road = factor(`Road/corridor`, levels = rev(`Road/corridor`))) |>
+  ggplot(aes(Cases, road)) +
+  geom_col(fill = "#A51C30", width = 0.7) +
+  geom_text(aes(label = Cases), hjust = -0.25, size = 3) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12)), breaks = pretty_breaks()) +
+  labs(x = "Cases matched to a road", y = NULL,
+       caption = "Counts do not adjust for road use or traffic volume.") +
+  theme_report()
+```
+
+A small number of roads account for a large share of the cases. The top five corridors hold `r top5_roads_n` of the `r matched_n` road-matched cases (`r fmt_pct(top5_roads_n, matched_n, 0)`), and national highways as a whole hold `r national_hwy_n` (`r fmt_pct(national_hwy_n, matched_n, 0)`). **`r top_road`** has the most, with `r top_road_events` cases (`r fmt_pct(top_road_events, matched_n, 0)` of all matched cases). This makes it the first road to examine for safety improvements. `r if (nrow(tied_roads)) paste0(paste(tied_roads$road, collapse = ", "), " also has ", tied_roads$recorded_accidents[1], " cases and ranks just below the table.") else ""`
+
+
+Corridors with many lower-confidence matches should be checked on site before any works are planned.
+
+\keepspace{10\baselineskip}
+
+### Journey Type: Commuting and RTA
+```{r route-type-summary, results='asis'}
+route_type_summary <- route_stats |>
+  st_drop_geometry() |>
+  group_by(Type) |>
+  summarise(
+    `Original routes` = n(),
+    `Total route length (km)` = round(sum(route_length_km, na.rm = TRUE), 2),
+    `Routes near another case's accident` = sum(other_case_accidents > 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+accident_type_summary <- accidents |>
+  st_drop_geometry() |>
+  count(Type, name = "Accident locations")
+
+type_route_table <- full_join(route_type_summary, accident_type_summary, by = "Type") |>
+  mutate(
+    across(c(`Original routes`, `Routes near another case's accident`,
+             `Accident locations`), ~ tidyr::replace_na(.x, 0L)),
+    `Total route length (km)` = tidyr::replace_na(`Total route length (km)`, 0)
+  ) |>
+  arrange(match(Type, c("Commuting", "RTA")), Type)
+
+kable(type_route_table, booktabs = TRUE, position = "H", format.args = list(big.mark = ","),
+      caption = "Spatial coverage by journey type. Each route is counted once.")
+```
+
+The table above compares commuting and on-duty (RTA) journeys. Each route is counted once, even where the original file split it into several pieces. *Routes near another case's accident* counts the routes that pass within `r fmt_num(radius_m)` m of an accident from a different case file. These counts cover the mapped cases only. They are not national accident totals.
+
+```{r route-length-scalars, include=FALSE}
+km_per_route <- function(t) {
+  r <- route_stats$route_length_km[route_stats$Type == t]
+  if (length(r)) mean(r, na.rm = TRUE) else NA_real_
+}
+km_median <- function(t) median(route_stats$route_length_km[route_stats$Type == t], na.rm = TRUE)
+```
+
+Commuting routes average `r fmt_num(km_per_route("Commuting"), 1)` km (median `r fmt_num(km_median("Commuting"), 1)` km). On-duty routes average `r fmt_num(km_per_route("RTA"), 1)` km (median `r fmt_num(km_median("RTA"), 1)` km). In total, `r cluster_share("RTA")` of on-duty points lie in a zone with another point, against `r cluster_share("Commuting")` of commuting points.
+
+## Localised Hotspots
+
+This section looks more closely at the densest zones. Zones are numbered by case count, so Zone 1 has the most cases. Every zone with more than `r hotspot_min_cases` cases is mapped below (up to `r hotspot_max_zones`). Zone numbers are reassigned each time the report is produced, so they may change when new cases are added. The place name in each heading is a more reliable reference.
+
+On each map, red dots are commuting accidents and purple dots are on-duty road traffic accidents (RTA). Both count equally towards a zone. The orange area is the zone, grey lines are the roads, and thicker grey lines are major roads (motorway, trunk or primary). The map extends 450 m beyond the zone to show the surroundings. The text for each zone gives its location and surroundings. Place names come from the case-file maps. The records do not state crash causes, so each site should be visited before any works are planned.
+
+```{r hotspot-table, results='asis'}
+kable(select(hotspot_table, -road_n), booktabs = TRUE, position = "H",
+      caption = paste0("The densest zones (more than ", hotspot_min_cases,
+                       " cases). Main road and district are the most frequent among the zone's cases."))
+```
+
+```{r zone-narratives}
+# Field descriptions written for known clusters. Each is attached to whichever
+# zone's centre falls inside its coordinate box, so it follows the place, not the
+# zone number (which changes as new cases are added).
+zone_narratives <- list(
+  list(title = "Gazipur Sadar -- Vogra Bypass -- Teknagopara Corridor (N3 Highway)",
+       lat = c(23.978, 24.005), lon = c(90.377, 90.383),
+       text = "**Location.** Gazipur Sadar Upazila, inside Gazipur City Corporation, along the N3.\n\n**What is around it.** Vogra Bypass, Telipara and Teknagopara. The case-file maps also mark Amin Super Market and several factories nearby."),
+  list(title = "Uttara -- Jashimuddin Avenue -- Airport Corridor (N3 Highway, Dhaka)",
+       lat = c(23.850, 23.870), lon = c(90.395, 90.410),
+       text = "**Location.** Northern Dhaka, around Jashimuddin Avenue in Uttara, along the N3.\n\n**What is around it.** The case-file maps mark the Jashimuddin bus stop and the Airport Flyover."),
+  list(title = "Kanchpur -- Bandar -- Dewanbag Industrial Belt (N1 Highway, Narayanganj)",
+       lat = c(23.689, 23.706), lon = c(90.523, 90.548),
+       text = "**Location.** Narayanganj District, on the eastern bank of the Shitalakshya River, covering Kanchpur Union (Sonargaon) and Bandar Upazila.\n\n**What is around it.** The N1 highway near the Kanchpur Bridge interchange and Dewanbag. The case-file maps also mark several factories nearby."),
+  list(title = "Mawna -- Gorgoria Master Bari Cluster (N3 Highway, Sreepur, Gazipur)",
+       lat = c(24.187, 24.199), lon = c(90.408, 90.427),
+       text = "**Location.** Sreepur Upazila in northern Gazipur, about 50 km north of Dhaka, around Mawna and the Gorgoria Master Bari market on the N3.\n\n**What is around it.** The N3, near Gilar Chala Road. The case-file maps also mark several factories nearby."),
+  list(title = "Baipayl -- Ashulia Corridor (N540 Highway, Dhaka)",
+       lat = c(23.940, 23.960), lon = c(90.258, 90.278),
+       text = "**Location.** Baipayl, in the Ashulia area of Savar Upazila, Dhaka District.\n\n**What is around it.** The Nabinagar--Chandra Road (N540) and the Sreepur--Kashimpur Road."),
+  list(title = "Chattogram Industrial Belt -- Sagarika Road \\& Pahartali Corridor",
+       lat = c(22.354, 22.365), lon = c(91.769, 91.778),
+       text = "**Location.** Pahartali and Halishahar, inside Chattogram City Corporation, along Sagarika Road towards the N1 near Latifpur.\n\n**What is around it.** Sagarika Road and nearby factories."),
+  list(title = "Konabari -- BSCIC Industrial Corridor (N4 / Konabari Flyover, Gazipur)",
+       lat = c(24.009, 24.013), lon = c(90.310, 90.325),
+       text = "**Location.** Konabari, inside Gazipur City Corporation in western Gazipur, along the N4.\n\n**What is around it.** The Konabari Flyover and the service roads beneath it, with BSCIC Main Road and Ambag Road nearby. The case-file maps also mark several factories nearby."),
+  list(title = "Tongi -- Taragach -- Khailkur Corridor (N3 Highway, Gazipur)",
+       lat = c(23.929, 23.937), lon = c(90.385, 90.389),
+       text = "**Location.** Southern Gazipur, in Tongi and Gacha Thana, along the N3.\n\n**What is around it.** A crowded stretch of highway linking Board Bazar, Taragach and Khailkur.")
+)
+
+# Find the narrative whose box (padded ~1 km) contains the zone's centre
+find_zone_narrative <- function(zid) {
+  ctr <- st_coordinates(st_centroid(st_transform(st_union(accidents_m[accidents_m$zone_id == zid, ]), 4326)))
+  pad <- 0.01
+  for (n in zone_narratives) {
+    if (ctr[2] >= n$lat[1] - pad && ctr[2] <= n$lat[2] + pad &&
+        ctr[1] >= n$lon[1] - pad && ctr[1] <= n$lon[2] + pad) return(n)
+  }
+  NULL
+}
+```
+
+```{r hotspot-maps, results='asis', fig.height=5.2, fig.width=6.5, out.width="85%"}
+# One sub-section per hotspot zone: heading, map, case counts and, where a
+# field description exists for that location, the description text.
+for (zid in hotspot_zones$zone_id) {
+  info <- hotspot_table[hotspot_table$Zone == zid, ]
+  nar  <- find_zone_narrative(zid)
+  place <- if (!is.null(nar)) nar$title else dplyr::coalesce(info$`Main road`, paste("Zone in", info$District))
+  zone_keys <- accidents_m$map_key[accidents_m$zone_id == zid]
+  zone_ped  <- sum(d$Mode_clean[match(zone_keys, d$`File ID`)] == "Pedestrian", na.rm = TRUE)
+  cat("\n\n### Zone ", zid, ": ", place, "\n\n", sep = "")
+  print(render_zone_map(zid, paste0("Zone ", zid, " (", info$Cases, " cases: ",
+                                    info$Commuting, " commuting, ", info$RTA, " RTA)")))
+  cat("\n\n**Recorded cases.** ", info$Cases, " (", info$Commuting, " commuting, ", info$RTA,
+      " RTA). ",
+      if (zone_ped == info$Cases) "All involved a pedestrian." else paste0(zone_ped, " of ", info$Cases, " involved a pedestrian."),
+      if (!is.na(info$`Main road`)) paste0(" The most common matched road is ", info$`Main road`, " (", info$road_n, " of ", info$Cases, " cases)."),
+      "\n\n", sep = "")
+  if (!is.null(nar)) cat(nar$text, "\n\n") else
+    cat("*No site description is available for this zone. A site visit is recommended to identify local conditions.*\n\n")
+}
+```
+
+## Gender Distribution of Affected Workers
+
+```{r gender-pie, fig.height=3.8, fig.width=4.8, out.width="60%", fig.cap="Overall gender distribution of EIS worker accident cases."}
+gender_table <- d |>
+  filter(!is.na(Gender), Gender != "") |>
+  count(Gender, name = "Recorded cases") |>
+  mutate(
+    pct   = `Recorded cases` / sum(`Recorded cases`),
+    label = paste0(`Recorded cases`, "\n(", scales::percent(pct, accuracy = 1), ")")
+  )
+
+ggplot(gender_table, aes(x = "", y = `Recorded cases`, fill = Gender)) +
+  geom_col(width = 1, colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5),
+            size = 4, colour = "white", fontface = "bold") +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = c("Female" = "#D81B60", "Male" = "#1E88E5")) +
+  labs(title = "Gender distribution", fill = "Gender",
+       caption = "Source: EIS details_all_cases dataset.") +
+  theme_report() +
+  theme(axis.title = element_blank(), axis.text = element_blank(),
+        axis.ticks = element_blank(), panel.grid = element_blank())
+```
+
+```{r gender-table, results='asis'}
+gender_table |>
+  select(-pct, -label) |>
+  mutate(`Share (%)` = round(100 * `Recorded cases` / sum(`Recorded cases`), 1)) |>
+  kable(booktabs = TRUE, position = "H", caption = "Breakdown of EIS worker accident cases by gender.")
+```
+
+This section and the ones that follow use all `r eis_n` EIS intake cases, including those without a mapped location. Of these workers, **`r fmt_pct(male_n, eis_n)`** were men (`r male_n` cases) and **`r fmt_pct(female_n, eis_n)`** were women (`r female_n` cases). Workforce data by gender are not available, so these shares do not show risk by gender. The breakdown by case type is shown below.
+
+### Accidents by Case Type and Loss
+```{r case-type-loss, fig.height=3.8, fig.width=6.5, out.width="85%", fig.cap="Distribution of recorded cases by case type and loss category."}
+d |>
+  count(`Case Type`, Loss) |>
+  group_by(`Case Type`) |>
+  mutate(
+    pct   = n / sum(n),
+    label = paste0(n, "\n(", scales::percent(pct, accuracy = 1), ")")
+  ) |>
+  ungroup() |>
+  ggplot(aes(x = 2, y = pct, fill = Loss)) +
+  geom_col(width = 0.8, colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5),
+            size = 3, colour = "white", fontface = "bold", lineheight = 0.9) +
+  coord_polar(theta = "y", start = 0) +
+  xlim(0.5, 2.5) +
+  facet_wrap(~ `Case Type`) +
+  labs(title    = "Cases by type and loss category",
+       subtitle = "Each ring shows the loss outcomes within that case type",
+       fill = "Loss type",
+       caption = "Source: EIS details_all_cases dataset.") +
+  theme_report() +
+  theme(axis.title = element_blank(), axis.text = element_blank(),
+        axis.ticks = element_blank(), panel.grid = element_blank(),
+        strip.text = element_text(face = "bold"), plot.title.position = "plot")
+```
+
+The chart splits the cases by type of accident and by outcome (death or disability). Commuting accidents make up `r comm_n` of the `r eis_n` cases (`r fmt_pct(comm_n, eis_n, 0)`), and on-duty RTAs make up `r rta_n` (`r fmt_pct(rta_n, eis_n, 0)`).
+
+`r death_n` of the `r eis_n` cases (`r fmt_pct(death_n, eis_n, 0)`) were deaths and `r disab_n` (`r fmt_pct(disab_n, eis_n, 0)`) led to disability. Commuting accidents account for `r comm_death_n` of the `r death_n` deaths. Minor injuries do not appear in these records.
+
+### Gender Distribution by Case Type
+```{r gender-by-casetype-bar, fig.height=3.6, fig.width=6.5, out.width="85%", fig.cap="Gender composition within each EIS case type."}
+gender_by_type <- d |>
+  filter(!is.na(Gender), Gender != "", !is.na(`Case Type`)) |>
+  count(`Case Type`, Gender) |>
+  group_by(`Case Type`) |>
+  mutate(pct = n / sum(n)) |>
+  ungroup()
+
+ggplot(gender_by_type, aes(x = Gender, y = n, fill = Gender)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = paste0(n, "\n(", scales::percent(pct, accuracy = 1), ")")),
+            vjust = -0.3, size = 3, colour = "#263238") +
+  facet_wrap(~ `Case Type`) +
+  scale_fill_manual(values = c("Female" = "#D81B60", "Male" = "#1E88E5")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2)), breaks = pretty_breaks()) +
+  labs(title = "Gender breakdown by case type",
+       x = "Gender", y = "Recorded cases",
+       caption = "Source: EIS details_all_cases dataset.") +
+  theme_report() +
+  theme(strip.text = element_text(face = "bold"), plot.title.position = "plot")
+```
+
+### Gender Differences in Commuting Cases
+
+```{r gender-type-scalars, include=FALSE}
+female_comm_n <- n_where(d$Gender == "Female" & is_comm)
+female_rta_n  <- n_where(d$Gender == "Female" & is_rta)
+male_comm_n   <- n_where(d$Gender == "Male" & is_comm)
+male_rta_n    <- n_where(d$Gender == "Male" & is_rta)
+female_ped_n  <- n_where(d$Gender == "Female" & d$Mode_clean == "Pedestrian")
+```
+
+**`r if (female_comm_n == female_n) paste('All', female_n) else paste(female_comm_n, 'of the', female_n)` cases involving a woman happened while commuting**, and women make up `r fmt_pct(female_comm_n, comm_n)` of all commuting cases. `r if (female_rta_n == 0) paste0("All ", rta_n, " on-duty road traffic accidents involved men.") else paste0(female_rta_n, " of the ", rta_n, " on-duty road traffic accidents involved women.")` Men had `r male_comm_n` commuting cases and `r male_rta_n` on-duty cases.
+
+`r female_ped_n` of the `r female_n` cases involving women (`r fmt_pct(female_ped_n, female_n, 0)`) involved a worker on foot. The records do not give the time of day.
+
+## Incident Types and Transport Mode
+```{r mode-analysis, fig.height=4.2, fig.cap="Distribution of EIS worker accident cases by mode of transport and case type."}
+mode_ct <- d |>
+  filter(!is.na(Mode_clean), Mode_clean != "") |>
+  count(Mode_clean, `Case Type`) |>
+  group_by(Mode_clean) |>
+  mutate(
+    pct   = n / sum(n),
+    label = ifelse(n >= 10, paste0(n, " (", scales::percent(pct, accuracy = 1), ")"), "")
+  ) |>
+  ungroup()
+
+mode_totals <- mode_ct |> group_by(Mode_clean) |> summarise(total = sum(n)) |> arrange(desc(total))
+mode_ct     <- mode_ct |> mutate(Mode_clean = factor(Mode_clean, levels = mode_totals$Mode_clean))
+
+ggplot(mode_ct, aes(x = Mode_clean, y = n, fill = `Case Type`)) +
+  geom_col() +
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5),
+            colour = "white", size = 2.8) +
+  geom_text(data = mode_totals, aes(x = Mode_clean, y = total, label = total, fill = NULL),
+            vjust = -0.4, size = 3, fontface = "bold", colour = "#263238") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.14)), breaks = pretty_breaks()) +
+  scale_fill_discrete(na.translate = FALSE) +
+  labs(title    = "Worker accidents by mode of transport",
+       subtitle = "Each bar shows total cases; segments show case type composition",
+       x = "Mode", y = "Recorded cases", fill = "Case type",
+       caption = "Source: EIS details_all_cases dataset.") +
+  theme_report() +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1, size = 8.5),
+        plot.title.position = "plot")
+```
+
+```{r mode-table, results='asis'}
+d |>
+  filter(!is.na(Mode_clean), Mode_clean != "") |>
+  count(Mode_clean, name = "Recorded cases") |>
+  arrange(desc(`Recorded cases`)) |>
+  mutate(`Share (%)` = round(100 * `Recorded cases` / sum(`Recorded cases`), 1)) |>
+  rename(`Transport mode` = Mode_clean) |>
+  kable(booktabs = TRUE, position = "H", caption = "EIS worker accident cases by mode of transport.")
+```
+
+### Transport Mode in Recorded Cases
+
+The *Mode* field records how the worker was travelling, or the type of crash, at the time of the accident. *Vehicle to Vehicle* is the record's label for a collision between vehicles. Spelling variants in the original records (for example "Padestrain" and "Pedestrian") were merged.
+
+Walking is by far the most common category. **`r fmt_pct(mode_n("Pedestrian"), eis_n)`** of cases (`r mode_n("Pedestrian")`) involved a pedestrian. Of these, `r mode_n("Pedestrian", is_comm)` happened on the commute and `r mode_n("Pedestrian", is_rta)` while on duty.
+
+Crashes between vehicles are the next largest group, at **`r fmt_pct(mode_n("Vehicle to Vehicle"), eis_n)`** (`r mode_n("Vehicle to Vehicle")` cases: `r mode_n("Vehicle to Vehicle", is_comm)` commuting, `r mode_n("Vehicle to Vehicle", is_rta)` on duty). The records do not say which vehicles were involved.
+
+Motorcycles come third, with **`r fmt_pct(mode_n("Motorcycle"), eis_n)`** of cases (`r mode_n("Motorcycle")`; `r mode_n("Motorcycle", is_comm)` commuting, `r mode_n("Motorcycle", is_rta)` on duty). The workers in these cases range from machine operators and quality inspectors to merchandisers and senior staff.
+
+The remaining `r eis_n - mode_n("Pedestrian") - mode_n("Vehicle to Vehicle") - mode_n("Motorcycle")` cases involve other modes: easy-bikes (`r mode_n("Easy Bike")`), vans (`r mode_n("Van")`), buses (`r mode_n("Bus")`), CNG auto-rickshaws (`r mode_n("CNG")`), rickshaws (`r mode_n("Rickshaw")`) and other or unspecified modes (`r mode_n("Others")`).
+
+
+## Age Distribution of Affected Workers
+```{r age-gender-analysis, fig.height=4.0, fig.width=6.5, out.width="85%", fig.cap="Age-band distribution of EIS worker accident cases by gender."}
+age_gender <- d |>
+  filter(!is.na(Age_band), !is.na(Gender), Gender != "") |>
+  count(Age_band, Gender) |>
+  group_by(Age_band) |>
+  mutate(
+    pct   = n / sum(n),
+    label = ifelse(n >= 9, paste0(n, "\n(", scales::percent(pct, accuracy = 1), ")"), "")
+  ) |>
+  ungroup()
+
+age_totals <- age_gender |> group_by(Age_band) |> summarise(total = sum(n))
+
+ggplot(age_gender, aes(x = Age_band, y = n, fill = Gender)) +
+  geom_col(width = 0.72) +
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5),
+            colour = "white", size = 3, lineheight = 0.9) +
+  geom_text(data = age_totals, aes(x = Age_band, y = total, label = total, fill = NULL),
+            vjust = -0.4, size = 3, fontface = "bold", colour = "#263238") +
+  scale_fill_manual(values = c("Female" = "#D81B60", "Male" = "#1E88E5")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12)), breaks = pretty_breaks()) +
+  labs(title    = "Age distribution by gender",
+       subtitle = "Worker accident cases from the EIS details dataset",
+       x = "Age band", y = "Recorded cases", fill = "Gender",
+       caption = "Source: EIS details_all_cases dataset.") +
+  theme_report() +
+  theme(plot.title.position = "plot", legend.position = "bottom")
+```
+
+```{r age-table, results='asis'}
+d |>
+  filter(!is.na(Age_band)) |>
+  count(Age_band, name = "Recorded cases") |>
+  mutate(`Share (%)` = round(100 * `Recorded cases` / sum(`Recorded cases`), 1)) |>
+  rename(`Age band` = Age_band) |>
+  kable(booktabs = TRUE, position = "H", caption = "EIS worker accident cases by age band.")
+```
+
+### Age Patterns in Recorded Cases
+
+```{r age-scalars, include=FALSE}
+age_banded_n <- n_where(!is.na(d$Age_band))
+prime_n      <- age_n(c("25–34", "35–44"))
+young_n      <- age_n(c("<18", "18–24"))
+older_n      <- age_n(c("45–54", "55–64", "65+"))
+```
+
+The age chart and table use `r age_banded_n` cases. `r if (age_invalid_n) paste0("A further ", age_invalid_n, " records with an age above ", age_max_plausible, " years were left out.") else ""` The median age is `r fmt_num(median(age_valid))` years.
+
+The 25--34 and 35--44 groups together account for `r prime_n` cases (`r fmt_pct(prime_n, age_banded_n, 0)`). Workers under 25 account for `r young_n` cases (`r fmt_pct(young_n, age_banded_n, 0)`). Workers aged 45 and over account for `r older_n` cases (`r fmt_pct(older_n, age_banded_n, 0)`). Workforce data were not available, so these figures do not show risk by age.
+
+## Highest-Priority Areas
+```{r zones-table, results='asis'}
+zone_info <- matches |>
+  group_by(zone_id) |>
+  summarise(District = top_value(`District (Accident)`), .groups = "drop")
+multi_zones |> st_drop_geometry() |> head(10) |>
+  left_join(zone_info, by = "zone_id") |>
+  transmute(`Zone` = zone_id, `Recorded cases` = accident_count,
+            `Priority class` = risk_class, District) |>
+  kable(booktabs = TRUE, position = "H", caption = "Leading zones with two or more cases, for field verification.")
+```
+
+This table lists the ten zones with the most cases, using the priority classes defined in Section 3.2. `r more3 <- sum(multi_zones$accident_count == multi_zones$accident_count[10]) - sum(head(multi_zones$accident_count, 10) == multi_zones$accident_count[10]); if (more3 > 0) paste0("A further ", more3, if (more3 == 1) " zone holds " else " zones hold ", "the same number of cases as the last row. ") else ""`The zones at the top, especially those marked **Critical** or **Very high**, are recommended first for a road-safety audit. This report has not tested these patterns against chance. Zones marked **Elevated** hold two points and are recommended for monitoring as new records arrive. A zone can move up a class with only one or two new cases.
+
+# Discussion
+
+The spatial analysis shows *where* the mapped points lie: `r national_hwy_n` of the `r matched_n` road-matched points are on national highways, and `r clustered_cases_n` of the `r nrow(accidents)` points share a zone with another point. The intake records show *who* is affected and *how*: `r fmt_pct(comm_n, eis_n, 0)` of cases were commuting accidents, `r fmt_pct(mode_n('Pedestrian'), eis_n, 0)` involved a worker on foot and `r fmt_pct(death_n, eis_n, 0)` ended in death.
+
+These results show where recorded cases lie, but not why accidents happened there. The data do not record the time of day, the other vehicle or the exact sequence of events. Road-safety specialists should inspect each location before specific works are decided. Their findings should be checked against hospital, police and employer compensation records.
+
+
+# Recommendations
+
+The table below links each recommendation to the finding it responds to. These are recommendations from the authors. Their effect has not been tested in this study.
+
+```{r recommendations-table, results='asis'}
+recommendations <- data.frame(
+  Priority = c("Immediate", "Immediate", "Short term", "Short term", "Short term", "Mid term"),
+  `Finding` = c(
+    "Zones and corridors with the most cases",
+    "Cases with lower-confidence or unmatched road locations",
+    paste0("Many workers were on foot (", fmt_pct(mode_n("Pedestrian"), eis_n, 0), " of cases)"),
+    paste0(if (female_comm_n == female_n) paste("All", female_n) else paste(female_comm_n, "of", female_n), " cases involving women were commuting accidents"),
+    paste0(national_hwy_n, " of ", matched_n, " road-matched points were on national highways"),
+    "Any completed safety improvement"
+  ),
+  `Recommended action` = c(
+    "Carry out day and night road-safety inspections at the top zones, focusing on factory gates, crossing points and bus stops.",
+    "Confirm the exact accident location on site before spending money on road works.",
+    "Build footbridges with ramps, signalised crossings with a safe middle island, and continuous footpaths.",
+    "Install good street lighting along the main routes workers walk and at easy-bike and bus pick-up points; make crossings safe and well lit.",
+    "Reduce speeds near factory areas with traffic calming suited to each road type, median barriers and speed enforcement.",
+    "Compare speeds, crossing behaviour and the number of new cases before and after the work to check that it is effective."
+  ),
+  check.names = FALSE
+)
+kable(
+  recommendations, format = "latex", booktabs = TRUE, position = "H",
+  align = c("p{0.12\\linewidth}", "p{0.28\\linewidth}", "p{0.48\\linewidth}"),
+  caption = "Recommended actions and the findings that support them."
+)
+```
+
+The overall aim is to separate people on foot from fast traffic wherever possible. Employers can support the road authorities in several ways. They can provide or hire safer transport and set up proper pick-up and drop-off points. They can require contracted drivers to keep to safe speeds, keep factory entrances well lit and clearly marked, and stagger shift times. They should also report accidents promptly.
+
+# Conclusion
+
+In the EIS pilot records, the districts with the most cases are `r top_districts`. National highways hold `r fmt_pct(national_hwy_n, matched_n, 0)` of the road-matched points. Of all intake cases, `r fmt_pct(comm_n, eis_n, 0)` happened on the commute, `r fmt_pct(mode_n('Pedestrian'), eis_n, 0)` involved a worker on foot and `r fmt_pct(death_n, eis_n, 0)` ended in death. `r if (female_comm_n == female_n) 'All cases involving women were commuting accidents.' else paste0('Of the cases involving women, ', fmt_pct(female_comm_n, female_n, 0), ' were commuting accidents.')`
+
+The roads and zones with the most points are recommended as the first places for inspection. The recommended measures are safe pedestrian crossings, continuous footpaths, slower speeds near factory gates, proper pick-up points for transport and better lighting at night. Each site should be inspected before work starts, and case numbers should be compared before and after any works. As the EIS pilot collects more cases, this report can be produced again from the updated data.
+
+# Reproducibility
+
+The report is generated from `EIS Pilot Report.Rmd`. It reads the source Parquet, CSV and GeoPackage files directly, links GPS and intake records by case file ID, applies the rules described above, and creates all tables, figures and quoted numbers each time it is produced. When the data files are updated (for example, new cases added or a location corrected), producing the report again updates every result automatically. The road-matching functions are in `R/road_risk_analysis.R`.
+
+The expected project structure is:
+
+- `EIS Pilot Report.Rmd`: the report.
+- `R/road_risk_analysis.R`: road-matching and corridor-summary functions.
+- `data/points.parquet`, `data/paths.parquet`: mapped journey points and routes.
+- `data/details_all_cases.csv`: EIS intake records.
+- `data/osm_roads.gpkg`: OpenStreetMap road extract.
+- `word-reference.docx`, `word-tables.lua`: page and table styles for the Word version.
+
+Map background tiles are downloaded once and stored in `data/maptiles_cache/`. To produce the report, run the following from the project folder:
+```{r reproducibility-code, eval=FALSE, echo=TRUE}
+rmarkdown::render("EIS Pilot Report.Rmd", output_format = "pdf_document")
+rmarkdown::render("EIS Pilot Report.Rmd", output_format = "word_document")
+
+# To test a different zone radius, e.g. 500 m:
+rmarkdown::render("EIS Pilot Report.Rmd", params = list(risk_radius_m = 500))
+```
+
+The default radius is `r fmt_num(radius_m)` m. The data folder can also be changed with the `project_data_dir` parameter.
+
+# Limitations
+
+The points below should be kept in mind when reading or citing the results of this report.
+
+```{r limitations-scalars, include=FALSE}
+no_map <- !d$`File ID` %in% accidents$map_key
+nomap_comm_n <- sum(is_comm & no_map)
+nomap_rta_n  <- sum(is_rta & no_map)
+```
+
+## Coverage of the Records
+
+These records are cases reported to the EIS pilot, not a full count of every road accident. They include only deaths and disabilities. The results describe these cases only. They should not be read as national accident totals.
+
+Not every record appears in every part of the analysis. In total, `r eis_n - intake_mapped_n` of the `r eis_n` intake cases have no map data (`r nomap_comm_n` commuting and `r nomap_rta_n` on duty). They count in the gender, age and transport findings, but not in the zones or road counts. A further `r length(gps_unmatched)` mapped case files have no intake record. They count in the zones and road counts, but not in the gender, age and transport findings. The zone and road results may change as these gaps are filled.
+
+## Risk and Causes
+
+The amount of traffic on each road, the number of workers in each area and how often they travel are not known. The counts in this report therefore show where cases happened, not how risky each road really is.
+
+The records do not give the time of day, the other vehicle or the exact sequence of events. Clusters have not been tested against chance.
+
+## Road Matching
+
+Accident locations were mapped from the case files. In total, `r unmatched_n` mapped points could not be linked to a road within 50 m, and `r lower_conf_n` were linked with lower confidence.
+
+Road lines and names come from a project OpenStreetMap extract that holds only road pieces close to the accident points. The extract does not cover every point: `r sum(matches$match_distance_m > 1000)` of the `r unmatched_n` unmatched points lie more than 1 km from any road in it. Most unmatched points are on-duty RTA records (`r unmatched_rta_n` of `r unmatched_n`), and only `r sum(accidents$Type == "RTA") - unmatched_rta_n` of the `r sum(accidents$Type == "RTA")` mapped on-duty cases have a road match. On-duty cases are therefore under-represented in the road counts.
+
+Table 4 and Figure 2 show only corridors with an English name or route number. A further `r unnamed_cases_n` road-matched cases lie on other roads and are left out of them.  `r if (nrow(tied_roads)) paste0(paste(tied_roads$road, collapse = ", "), " has the same number of cases as the last corridor in the table but falls outside it.") else ""`
+
+## Zone Radius
+
+The `r fmt_num(radius_m)` m radius is a working choice. Results at other radii are not shown. The radius can be changed when the report is produced (see Reproducibility).
+
+\newpage
+
+# References and Data Provenance
+
+**Published literature**
+
+- Billah, M., Shaik, M. E., Hossain, M. S., Jahan Sakib, S. E., and Rahman, L. (2026). Identification and analysis of road traffic crash hotspots using Geographic Information System (GIS): A study on Dhaka-Mawa Expressway (N804), Bangladesh. *Journal of Sensors*, 2026(1), 5619948. <https://doi.org/10.1155/js/5619948>
+- Debnath, M., Hasanat-E-Rabbi, S., Hamim, O. F., Hoque, M. S., McIlroy, R. C., Plant, K. L., and Stanton, N. A. (2021). An investigation of urban pedestrian behaviour in Bangladesh using the Perceptual Cycle Model. *Safety Science*, 138, 105214. <https://doi.org/10.1016/j.ssci.2021.105214>
+- GBD 2023 Road Injuries Collaborators (2026). Global, regional, and national burden of road injuries 1990-2023: A systematic analysis for the Global Burden of Disease Study 2023. *The Lancet Public Health*, 11(9), e589-e603. <https://doi.org/10.1016/S2468-2667(26)00141-6>
+- Khatun, M. S., Hossain, M. A., Kabir, M. A., and Rahman, M. A. (2024). Identification and analysis of accident black spots using Geographic Information System (GIS): A study on Kushtia-Jhenaidah national highway (N704), Bangladesh. *Heliyon*, 10(3), e25952. <https://doi.org/10.1016/j.heliyon.2024.e25952>
+- Sakib, N., Paul, T., Das, S., and Hossain, A. (2025). Exploring the factors affecting injury severity in highway and non-highway crashes in Bangladesh applying machine learning and SHAP. *IATSS Research*, 49(2), 259-270. <https://doi.org/10.1016/j.iatssr.2025.06.001>
+- Sánchez-Toledo Ledesma, A., and Fernández Laviada, N. (2026). Commuting crashes in Spanish occupational road traffic injury surveillance: An integrated descriptive analysis, 2020-2024. *Traffic Injury Prevention*. Advance online publication. <https://doi.org/10.1080/15389588.2026.2717387>
+- Sarkar, S., Tay, R., and Hunt, J. D. (2011). Logistic regression model of risk of fatality in vehicle-pedestrian crashes on national highways in Bangladesh. *Transportation Research Record*, 2264(1), 128-137. <https://doi.org/10.3141/2264-15>
+
+**Data sources and other records**
+
+- International Labour Organization. News release on the launch of the pilot Employment Injury Scheme, June 2022. <https://www.ilo.org/resource/news/pilot-employment-injury-scheme-launched-provide-income-protection>
+- OpenStreetMap contributors. Road geometry and attributes in the project extract, licensed under the Open Data Commons Open Database License (ODbL).
+- EIS worker accident case and journey-route records supplied for this analysis.
+- EIS case intake details: `data/details_all_cases.csv`.

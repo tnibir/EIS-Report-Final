@@ -1,0 +1,766 @@
+---
+title: "Interactive Accident Location Explorer"
+subtitle: "EIS Pilot – Worker Accident Locations (Verification Map)"
+author: "Tasbiul Islam Nibir"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    self_contained: true
+    theme: flatly
+    toc: false
+params:
+  risk_radius_m: 1000
+  project_data_dir: null
+---
+
+<style type="text/css">
+/* Utilize the full browser window width without side margins */
+.main-container {
+  max-width: 100% !important;
+  width: 100% !important;
+  margin: 0 !important;
+  padding: 12px 24px !important;
+}
+.leaflet, .html-widget {
+  width: 100% !important;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+## ── Required packages ────────────────────────────────────────────────────────
+required_packages <- c(
+  "sf", "dplyr", "readr", "leaflet", "leaflet.extras",
+  "arrow", "stringr", "htmltools", "DT"
+)
+missing_pkg <- required_packages[!vapply(required_packages, requireNamespace,
+                                         logical(1), quietly = TRUE)]
+if (length(missing_pkg)) {
+  stop("Install required packages first:\n  install.packages(c(",
+       paste0('"', missing_pkg, '"', collapse = ", "), "))")
+}
+
+library(sf); library(dplyr); library(readr)
+library(leaflet); library(leaflet.extras)
+library(arrow); library(stringr); library(htmltools); library(DT)
+
+## ── Resolve project root ─────────────────────────────────────────────────────
+input_file <- knitr::current_input(dir = TRUE)
+if (is.null(input_file) || !nzchar(input_file)) input_file <- "interactive_accident_map.Rmd"
+project_root <- normalizePath(dirname(input_file), winslash = "/", mustWork = TRUE)
+
+## ── Source helper functions from the main report ─────────────────────────────
+analysis_script <- file.path(project_root, "R", "road_risk_analysis.R")
+if (!file.exists(analysis_script)) stop("Required analysis script not found: ", analysis_script)
+source(analysis_script, local = TRUE)
+
+## ── Validate parameters ───────────────────────────────────────────────────────
+radius_m <- as.numeric(params$risk_radius_m)
+if (!is.finite(radius_m) || radius_m <= 0) stop("risk_radius_m must be a positive number.")
+
+## ── Resolve data directory ───────────────────────────────────────────────────
+configured_data_dir <- params$project_data_dir
+if (is.null(configured_data_dir) || is.na(configured_data_dir) || !nzchar(configured_data_dir)) {
+  configured_data_dir <- NA_character_
+}
+if (!is.na(configured_data_dir) && !grepl("^([A-Za-z]:[/\\\\]|/)", configured_data_dir)) {
+  configured_data_dir <- file.path(project_root, configured_data_dir)
+}
+data_candidates <- unique(c(configured_data_dir, file.path(project_root, "data")))
+data_candidates <- data_candidates[!is.na(data_candidates) & nzchar(data_candidates)]
+
+required_files <- c("points.parquet", "paths.parquet", "osm_roads.gpkg", "details_all_cases.csv")
+valid_dir <- vapply(data_candidates, function(x) all(file.exists(file.path(x, required_files))), logical(1))
+if (!any(valid_dir)) stop("Required data files not found under: ", paste(data_candidates, collapse = " | "))
+data_dir <- normalizePath(data_candidates[which(valid_dir)[1]], winslash = "/", mustWork = TRUE)
+
+## ── Load data ─────────────────────────────────────────────────────────────────
+points_raw   <- arrow::read_parquet(file.path(data_dir, "points.parquet"))
+paths_raw    <- arrow::read_parquet(file.path(data_dir, "paths.parquet"))
+roads        <- st_read(file.path(data_dir, "osm_roads.gpkg"), quiet = TRUE)
+case_details <- read.csv(file.path(data_dir, "details_all_cases.csv"),
+                         stringsAsFactors = FALSE, check.names = FALSE, fileEncoding = "UTF-8-BOM")
+
+## ── Normalise helper functions (mirrors main report) ─────────────────────────
+normalise_type <- function(x) {
+  x <- stringr::str_to_lower(stringr::str_trim(as.character(x)))
+  dplyr::case_when(
+    x %in% c("commuting", "commute", "commuting accident") ~ "Commuting",
+    x %in% c("rta", "road traffic accident", "on-duty rta", "on duty rta") ~ "RTA",
+    is.na(x) | x == "" ~ "Unknown",
+    TRUE ~ stringr::str_to_title(x)
+  )
+}
+
+normalise_district <- function(x) {
+  x <- stringr::str_to_title(stringr::str_squish(as.character(x)))
+  dplyr::recode(x, "Chittagong" = "Chattogram", "Narayangonj" = "Narayanganj",
+                "Hobigonj" = "Habiganj", "Comilla" = "Cumilla")
+}
+
+make_map_key <- function(x) sub("\\.kmz$", "", trimws(as.character(x)), ignore.case = TRUE)
+
+map_key_aliases <- c("crystal martin" = "2026.EIS.000151", "impress fashion" = "2026.EIS.000157")
+resolve_map_key <- function(key, file_ids) {
+  serial    <- function(x) sub("^.*EIS\\.", "", x)
+  by_serial <- file_ids[match(serial(key), serial(file_ids))]
+  by_serial[!grepl("EIS\\.", key)] <- NA_character_
+  dplyr::coalesce(file_ids[match(key, file_ids)], by_serial,
+                  unname(map_key_aliases[tolower(key)]), key)
+}
+
+case_details$`File ID`              <- make_map_key(case_details$`File ID`)
+case_details$`District (Accident)`  <- normalise_district(case_details$`District (Accident)`)
+case_details$`District (Factory)`   <- normalise_district(case_details$`District (Factory)`)
+
+# Merge the spelling variants of transport mode, as in the main report
+case_details <- case_details |>
+  mutate(Mode = case_when(
+    str_detect(str_to_lower(Mode), "van")                  ~ "Van",
+    str_detect(str_to_lower(Mode), "easy")                 ~ "Easy Bike",
+    str_detect(str_to_lower(Mode), "motor")                ~ "Motorcycle",
+    str_detect(str_to_lower(Mode), "pedest|padest|padist") ~ "Pedestrian",
+    str_detect(str_to_lower(Mode), "cng")                  ~ "CNG",
+    str_detect(str_to_lower(Mode), "bus")                  ~ "Bus",
+    str_detect(str_to_lower(Mode), "vehicle")              ~ "Vehicle to Vehicle",
+    str_detect(str_to_lower(Mode), "other")                ~ "Others",
+    TRUE ~ Mode
+  ))
+
+## ── Build accident sf (B markers only) ───────────────────────────────────────
+accidents <- points_raw |>
+  mutate(
+    Type    = normalise_type(Source),
+    map_key = resolve_map_key(make_map_key(Source_File), case_details$`File ID`),
+    File    = map_key,
+    Layer   = KML_Layer,
+    marker_order = suppressWarnings(as.integer(sub(".*_([0-9]+)$", "\\1", Feature_ID)))
+  ) |>
+  group_by(map_key, Layer) |>
+  arrange(marker_order, .by_group = TRUE) |>
+  filter(n() >= 3, row_number() == 2) |>
+  ungroup() |>
+  st_as_sf(wkt = "Geometry_WKT", crs = 4326) |>
+  st_zm() |>
+  (\(x) x[!st_is_empty(x), ])() |>
+  left_join(case_details |> mutate(map_key = `File ID`), by = "map_key")
+
+## ── Drop points outside Bangladesh ────────────────────────────────────────────
+bd_bbox    <- c(xmin = 88.0, ymin = 20.5, xmax = 92.8, ymax = 26.7)
+acc_xy     <- st_coordinates(accidents)
+inside_bd  <- acc_xy[, 1] >= bd_bbox["xmin"] & acc_xy[, 1] <= bd_bbox["xmax"] &
+              acc_xy[, 2] >= bd_bbox["ymin"] & acc_xy[, 2] <= bd_bbox["ymax"]
+
+outside_bd <- accidents[!inside_bd, ]
+accidents  <- accidents[inside_bd, ]
+
+if (nrow(accidents) == 0L) stop("No accident (B) points found inside Bangladesh.")
+
+# Link between the intake records and the map files
+intake_mapped_n <- length(intersect(accidents$map_key, case_details$`File ID`))
+map_only_n      <- length(setdiff(accidents$map_key, case_details$`File ID`))
+
+## ── Build route sf ────────────────────────────────────────────────────────────
+paths_raw <- paths_raw |>
+  mutate(
+    Type    = normalise_type(Source),
+    map_key = resolve_map_key(make_map_key(Source_File), case_details$`File ID`),
+    File    = map_key,
+    Layer   = KML_Layer,
+    `Path Name` = Name,
+    Original_Route_ID = as.character(`Path Key`)
+  )
+
+routes <- st_as_sf(paths_raw, wkt = "Geometry_WKT", crs = 4326) |>
+  st_zm() |>
+  (\(x) x[!st_is_empty(x), ])() |>
+  filter(!paste(map_key, Layer) %in% paste(outside_bd$map_key, outside_bd$Layer))
+
+## ── Project to metres for zone computation ────────────────────────────────────
+analysis_crs <- 32646
+accidents_m  <- st_transform(accidents, analysis_crs)
+roads_m      <- st_transform(roads,     analysis_crs)
+
+## ── Compute zones (connected-component buffers) ───────────────────────────────
+buffers_m <- st_buffer(accidents_m, radius_m)
+links     <- st_intersects(buffers_m)
+
+component    <- rep(NA_integer_, length(links))
+component_id <- 0L
+for (seed in seq_along(links)) {
+  if (!is.na(component[seed])) next
+  component_id    <- component_id + 1L
+  queue           <- seed
+  component[seed] <- component_id
+  while (length(queue)) {
+    current <- queue[1]; queue <- queue[-1]
+    unseen  <- links[[current]][is.na(component[links[[current]]])]
+    if (length(unseen)) { component[unseen] <- component_id; queue <- c(queue, unseen) }
+  }
+}
+zone_rank         <- order(-tabulate(component), seq_len(max(component)))
+component         <- match(component, zone_rank)
+accidents_m$zone_id <- component
+
+## ── Build zone polygons ───────────────────────────────────────────────────────
+zones_m <- buffers_m |>
+  mutate(zone_id = component) |>
+  group_by(zone_id) |>
+  summarise(accident_count = n(), .groups = "drop") |>
+  mutate(risk_class = case_when(
+    accident_count >= 8 ~ "Critical",
+    accident_count >= 5 ~ "Very high",
+    accident_count >= 3 ~ "High",
+    accident_count >= 2 ~ "Elevated",
+    TRUE                ~ "Observed"
+  ))
+
+zones_wgs <- st_transform(zones_m, 4326)
+
+## ── Road matching for popup labels ────────────────────────────────────────────
+matches <- match_accidents_to_roads(accidents_m, roads_m)
+
+readable_road_label <- function(ref, name, highway, osm_id) {
+  known_routes <- c(
+    N1 = "Dhaka–Chattogram Hwy", N2 = "Dhaka–Sylhet Hwy",
+    N3 = "Dhaka–Mymensingh Hwy", N4 = "Joydebpur–Jamalpur Hwy",
+    N5 = "Dhaka–Aricha Hwy"
+  )
+  road_types <- c(
+    motorway = "motorway", trunk = "trunk road", primary = "primary road",
+    secondary = "secondary road", tertiary = "tertiary road",
+    residential = "residential road", service = "service road",
+    unclassified = "local road", motorway_link = "motorway link",
+    trunk_link = "trunk link", primary_link = "primary link"
+  )
+  mapply(function(rref, rname, rclass, wid) {
+    vals  <- trimws(c(rref, rname, rclass)); vals[vals == ""] <- NA_character_
+    rref  <- vals[1]; rname <- vals[2]
+    rclass <- strsplit(dplyr::coalesce(vals[3], "local"), ";", fixed = TRUE)[[1]][1]
+    readable <- !is.na(rname) && grepl("[A-Za-z]", rname) &&
+                !grepl("<U\\+[0-9A-Fa-f]{4,6}>", rname)
+    if (!is.na(rref) && rref %in% names(known_routes)) unname(known_routes[rref])
+    else if (readable) gsub("\\s+-\\s+", " to ", rname)
+    else {
+      tl <- dplyr::coalesce(unname(road_types[rclass]), "local road")
+      if (!is.na(rref) && grepl("^N[0-9]+$", rref)) paste("National highway", rref)
+      else if (!is.na(rref)) paste(rref, tl)
+      else if (!is.na(rname)) rname
+      else paste("Unnamed", tl)
+    }
+  }, ref, name, highway, osm_id, USE.NAMES = FALSE)
+}
+
+## ── Annotate accident points ───────────────────────────────────────────────────
+accidents_plot <- accidents |>
+  mutate(
+    `File ID` = dplyr::coalesce(`File ID`, map_key),
+    zone_id   = accidents_m$zone_id,
+    lon       = st_coordinates(accidents)[, 1],
+    lat       = st_coordinates(accidents)[, 2]
+  ) |>
+  left_join(
+    matches |>
+      st_drop_geometry() |>
+      select(map_key, Layer, ref, name, highway, osm_id, match_confidence),
+    by = c("map_key", "Layer")
+  ) |>
+  mutate(
+    matched_road = ifelse(
+      !is.na(osm_id),
+      readable_road_label(ref, name, highway, osm_id),
+      "Unmatched (>50 m from any road)"
+    ),
+    risk_class = zones_wgs$risk_class[match(zone_id, zones_wgs$zone_id)],
+    zone_count = zones_wgs$accident_count[match(zone_id, zones_wgs$zone_id)]
+  )
+
+## ── Colour palettes ───────────────────────────────────────────────────────────
+type_colours <- c(
+  "Commuting" = "#D32F2F",
+  "RTA"       = "#6A1B9A",
+  "Unknown"   = "#546E7A"
+)
+
+zone_colours <- c(
+  "Critical"  = "#B71C1C",
+  "Very high" = "#E64A19",
+  "High"      = "#F57F17",
+  "Elevated"  = "#1565C0",
+  "Observed"  = "#2E7D32"
+)
+
+risk_order <- c("Critical", "Very high", "High", "Elevated", "Observed")
+```
+
+---
+
+> **Purpose:** This interactive map is a companion to the main EIS Pilot Report. It lets you zoom in on every accident location, inspect individual case details, toggle route lines and priority zones, and verify that coordinates are correctly placed. Use it alongside field visits and original case files. Zones show where cases are concentrated. They are not accident rates, because the number of people using each road is not known.
+
+---
+
+## Interactive Map {.tabset}
+
+```{r build-map, fig.height=7}
+
+## ── Build popup HTML for each accident point ──────────────────────────────────
+build_popup <- function(df) {
+  mapply(function(fid, type, loss, gender, age, mode, district_acc,
+                  district_fac, date_acc, case_type,
+                  road, conf, zone, zone_n, risk, lon, lat) {
+
+    conf_badge <- switch(as.character(conf),
+      "High"      = '<span style="color:#2E7D32;font-weight:bold">✔ High confidence</span>',
+      "Lower"     = '<span style="color:#E65100;font-weight:bold">⚠ Lower confidence</span>',
+                    '<span style="color:#B71C1C;font-weight:bold">✖ Unmatched</span>'
+    )
+
+    risk_col <- zone_colours[as.character(risk)]
+    if (is.na(risk_col)) risk_col <- "#546E7A"
+
+    paste0(
+      '<div style="font-family:sans-serif;font-size:13px;min-width:260px;max-width:340px">',
+      '<div style="background:#37474F;color:white;padding:6px 10px;border-radius:4px 4px 0 0;',
+      'margin:-9px -13px 8px -13px">',
+      '<strong>Case: ', htmltools::htmlEscape(fid), '</strong>',
+      '&nbsp;&nbsp;<span style="background:', htmltools::htmlEscape(type_colours[type]),
+      ';padding:2px 6px;border-radius:10px;font-size:11px">',
+      htmltools::htmlEscape(type), '</span>',
+      '</div>',
+
+      # Zone info
+      '<div style="background:', htmltools::htmlEscape(risk_col),
+      '22;border-left:4px solid ', htmltools::htmlEscape(risk_col),
+      ';padding:4px 8px;margin-bottom:8px;border-radius:0 4px 4px 0">',
+      '<b>Zone ', zone, '</b> &mdash; ', risk, ' priority',
+      ' &nbsp;(', zone_n, ' case', ifelse(zone_n == 1, '', 's'), ' in zone)',
+      '</div>',
+
+      # Victim details
+      '<table style="width:100%;border-collapse:collapse">',
+      tr2("Loss",        coalesce_str(loss,     "—")),
+      tr2("Gender",      coalesce_str(gender,   "—")),
+      tr2("Age",         coalesce_str(age,      "—")),
+      tr2("Mode",        coalesce_str(mode,     "—")),
+      tr2("Case type",   coalesce_str(case_type,"—")),
+      tr2("Date",        coalesce_str(date_acc, "—")),
+      '</table>',
+
+      '<hr style="margin:6px 0;border-color:#e0e0e0">',
+
+      # Location details
+      '<table style="width:100%;border-collapse:collapse">',
+      tr2("District (accident)", coalesce_str(district_acc, "—")),
+      tr2("District (factory)",  coalesce_str(district_fac, "—")),
+      '</table>',
+
+      '<hr style="margin:6px 0;border-color:#e0e0e0">',
+
+      # Road match
+      '<div style="font-size:11px;color:#546E7A">',
+      '<b>Matched road:</b> ', htmltools::htmlEscape(coalesce_str(road, "—")), '<br>',
+      '<b>Match quality:</b> ', conf_badge, '<br>',
+      '<b>Coordinates:</b> ', round(lat, 5), ', ', round(lon, 5),
+      '</div>',
+      '</div>'
+    )
+  },
+  df$`File ID` %||% df$map_key,
+  df$Type, df$Loss, df$Gender, df$Age, df$Mode,
+  df$`District (Accident)`, df$`District (Factory)`,
+  df$`Date (Accident)`, df$`Case Type`,
+  df$matched_road, df$match_confidence,
+  df$zone_id, df$zone_count, df$risk_class,
+  df$lon, df$lat,
+  SIMPLIFY = TRUE, USE.NAMES = FALSE)
+}
+
+## Helper: two-cell table row
+tr2 <- function(label, value) {
+  paste0(
+    '<tr><td style="color:#78909C;padding:1px 4px 1px 0;white-space:nowrap">',
+    label, ':</td>',
+    '<td style="padding:1px 0"><b>', htmltools::htmlEscape(value), '</b></td></tr>'
+  )
+}
+coalesce_str <- function(x, default = "—") {
+  if (is.null(x) || all(is.na(x)) || all(!nzchar(trimws(as.character(x))))) default
+  else trimws(as.character(x))
+}
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+popups <- build_popup(accidents_plot)
+accidents_plot$popup           <- popups
+accidents_plot$marker_label    <- paste0("[", accidents_plot$Type, "] ", accidents_plot$`File ID`)
+accidents_plot$unmatched_label <- paste0("⚠ Unmatched: ", accidents_plot$`File ID`)
+
+## ── Zone polygon popups ───────────────────────────────────────────────────────
+zone_popups <- mapply(function(zid, cnt, rcls) {
+  col <- zone_colours[rcls]; if (is.na(col)) col <- "#546E7A"
+  paste0(
+    '<div style="font-family:sans-serif;font-size:13px">',
+    '<b>Zone ', zid, '</b><br>',
+    '<span style="color:', col, ';font-weight:bold">', rcls, ' priority</span><br>',
+    cnt, ' case', ifelse(cnt == 1, '', 's'), ' in zone',
+    '</div>'
+  )
+}, zones_wgs$zone_id, zones_wgs$accident_count, zones_wgs$risk_class, SIMPLIFY = TRUE)
+
+## ── Route popup (minimal) ──────────────────────────────────────────────────────
+route_popups <- with(routes, paste0(
+  "<b>Type:</b> ", htmltools::htmlEscape(normalise_type(Source)),
+  "<br><b>Case:</b> ", htmltools::htmlEscape(map_key)
+))
+
+## ── Leaflet map ───────────────────────────────────────────────────────────────
+zone_pal <- colorFactor(
+  palette = unname(zone_colours[risk_order]),
+  levels  = risk_order,
+  ordered = TRUE
+)
+
+m <- leaflet(options = leafletOptions(zoomControl = TRUE), width = "100%", height = "750px") |>
+
+  ## Base tile layers
+  addProviderTiles("Esri.WorldGrayCanvas", group = "Light grey",    options = providerTileOptions(maxZoom = 16)) |>
+  addProviderTiles("OpenStreetMap",    group = "OpenStreetMap",    options = providerTileOptions(maxZoom = 19)) |>
+  addProviderTiles("Esri.WorldImagery",group = "Satellite",        options = providerTileOptions(maxZoom = 19)) |>
+
+  ## Priority zones
+  addPolygons(
+    data        = zones_wgs,
+    fillColor   = ~zone_pal(risk_class),
+    fillOpacity = 0.25,
+    color       = ~zone_pal(risk_class),
+    weight      = 1.8,
+    opacity     = 0.85,
+    popup       = zone_popups,
+    label       = ~paste0("Zone ", zone_id, ": ", risk_class, " (", accident_count, " cases)"),
+    group       = "Priority zones",
+    highlightOptions = highlightOptions(
+      weight      = 3,
+      fillOpacity = 0.45,
+      bringToFront = FALSE
+    )
+  ) |>
+
+  ## Journey routes
+  addPolylines(
+    data    = routes,
+    color   = ~ifelse(normalise_type(Source) == "Commuting", "#1565C0", "#00897B"),
+    weight  = 1.5,
+    opacity = 0.45,
+    popup   = route_popups,
+    group   = "Journey routes"
+  ) |>
+
+  ## Accident points – Commuting
+  addCircleMarkers(
+    data        = accidents_plot |> filter(Type == "Commuting"),
+    radius      = 7,
+    color       = "white",
+    weight      = 1.5,
+    fillColor   = type_colours["Commuting"],
+    fillOpacity = 0.9,
+    popup       = ~popup,
+    label       = ~marker_label,
+    group       = "Commuting accidents",
+    clusterOptions = markerClusterOptions(
+      disableClusteringAtZoom = 13,
+      spiderfyOnMaxZoom = TRUE
+    )
+  ) |>
+
+  ## Accident points – RTA
+  addCircleMarkers(
+    data        = accidents_plot |> filter(Type == "RTA"),
+    radius      = 7,
+    color       = "white",
+    weight      = 1.5,
+    fillColor   = type_colours["RTA"],
+    fillOpacity = 0.9,
+    popup       = ~popup,
+    label       = ~marker_label,
+    group       = "RTA accidents",
+    clusterOptions = markerClusterOptions(
+      disableClusteringAtZoom = 13,
+      spiderfyOnMaxZoom = TRUE
+    )
+  )
+
+if (any(accidents_plot$Type == "Unknown")) {
+  m <- m |>
+    addCircleMarkers(
+      data        = accidents_plot |> filter(Type == "Unknown"),
+      radius      = 7,
+      color       = "white",
+      weight      = 1.5,
+      fillColor   = type_colours["Unknown"],
+      fillOpacity = 0.9,
+      popup       = ~popup,
+      label       = ~marker_label,
+      group       = "Unknown type",
+      clusterOptions = markerClusterOptions(
+        disableClusteringAtZoom = 13,
+        spiderfyOnMaxZoom = TRUE
+      )
+    )
+}
+
+if (any(is.na(accidents_plot$osm_id))) {
+  m <- m |>
+    addCircleMarkers(
+      data        = accidents_plot |> filter(is.na(osm_id)),
+      radius      = 11,
+      color       = "#FF6F00",
+      weight      = 2.5,
+      fill        = FALSE,
+      opacity     = 0.8,
+      label       = ~unmatched_label,
+      group       = "Unmatched (>50 m)"
+    )
+}
+
+overl_groups <- c("Priority zones", "Journey routes", "Commuting accidents", "RTA accidents")
+if (any(accidents_plot$Type == "Unknown")) overl_groups <- c(overl_groups, "Unknown type")
+if (any(is.na(accidents_plot$osm_id))) overl_groups <- c(overl_groups, "Unmatched (>50 m)")
+
+m <- m |>
+  addLayersControl(
+    baseGroups    = c("Light grey", "OpenStreetMap", "Satellite"),
+    overlayGroups = overl_groups,
+    options       = layersControlOptions(collapsed = FALSE)
+  ) |>
+  hideGroup("Journey routes")
+
+if (any(is.na(accidents_plot$osm_id))) {
+  m <- m |> hideGroup("Unmatched (>50 m)")
+}
+
+m <- m |>
+  addLegend(
+    position = "bottomleft",
+    colors   = unname(type_colours[names(type_colours) %in% accidents_plot$Type]),
+    labels   = names(type_colours)[names(type_colours) %in% accidents_plot$Type],
+    title    = "Accident type",
+    opacity  = 0.9
+  ) |>
+  addLegend(
+    position = "bottomleft",
+    colors   = unname(zone_colours[risk_order]),
+    labels   = risk_order,
+    title    = paste0("Zone priority class<br><small>(", radius_m, " m radius)</small>"),
+    opacity  = 0.8
+  ) |>
+  addSearchOSM(options = searchOptions(autoCollapse = TRUE, minLength = 3)) |>
+  addMeasure(
+    position          = "topleft",
+    primaryLengthUnit = "meters",
+    primaryAreaUnit   = "sqmeters",
+    activeColor       = "#3D535D",
+    completedColor    = "#7D4479"
+  ) |>
+  fitBounds(
+    lng1 = min(accidents_plot$lon) - 0.05,
+    lat1 = min(accidents_plot$lat) - 0.05,
+    lng2 = max(accidents_plot$lon) + 0.05,
+    lat2 = max(accidents_plot$lat) + 0.05
+  )
+
+m
+```
+
+---
+
+## Summary & Data Provenance {.tabset}
+
+### Case Breakdown by Accident Type
+
+Below is the distribution of all mapped accident locations by accident classification, outcome (severity), and road-matching status:
+
+```{r summary-by-type, results='asis'}
+summary_type <- accidents_plot |>
+  st_drop_geometry() |>
+  group_by(Type) |>
+  summarise(
+    `Total Cases`        = n(),
+    `Share (%)`          = paste0(round(100 * n() / nrow(accidents_plot), 1), "%"),
+    `Deaths`             = sum(Loss == "Death", na.rm = TRUE),
+    `Disabilities`       = sum(Loss == "Disability", na.rm = TRUE),
+    `Matched (<= 50 m)`  = sum(!is.na(osm_id)),
+    `Unmatched (> 50 m)` = sum(is.na(osm_id)),
+    .groups = "drop"
+  )
+
+total_type <- data.frame(
+  Type                 = "**Total Mapped**",
+  `Total Cases`        = nrow(accidents_plot),
+  `Share (%)`          = "100.0%",
+  `Deaths`             = sum(accidents_plot$Loss == "Death", na.rm = TRUE),
+  `Disabilities`       = sum(accidents_plot$Loss == "Disability", na.rm = TRUE),
+  `Matched (<= 50 m)`  = sum(!is.na(accidents_plot$osm_id)),
+  `Unmatched (> 50 m)` = sum(is.na(accidents_plot$osm_id)),
+  check.names = FALSE
+)
+
+all_type_table <- rbind(summary_type, total_type)
+
+knitr::kable(all_type_table, align = c("l", "r", "r", "r", "r", "r", "r"))
+```
+
+### Priority Zones
+
+Circles of `r radius_m` m radius around each accident are grouped by overlap into priority zones:
+
+```{r summary-by-zone, results='asis'}
+summary_zones <- zones_wgs |>
+  st_drop_geometry() |>
+  group_by(risk_class) |>
+  summarise(
+    `Zone Count`         = n(),
+    `Total Cases`        = sum(accident_count),
+    `Share of Cases (%)` = paste0(round(100 * sum(accident_count) / nrow(accidents_plot), 1), "%"),
+    `Case Range`         = if (min(accident_count) == max(accident_count)) as.character(min(accident_count)) else paste0(min(accident_count), " – ", max(accident_count)),
+    .groups = "drop"
+  ) |>
+  mutate(risk_class = factor(risk_class, levels = risk_order)) |>
+  arrange(risk_class) |>
+  rename(`Priority Level` = risk_class)
+
+total_zones <- data.frame(
+  `Priority Level`     = "**All Zones**",
+  `Zone Count`         = nrow(zones_wgs),
+  `Total Cases`        = sum(zones_wgs$accident_count),
+  `Share of Cases (%)` = "100.0%",
+  `Case Range`         = paste0(min(zones_wgs$accident_count), " – ", max(zones_wgs$accident_count)),
+  check.names = FALSE
+)
+
+all_zone_table <- rbind(summary_zones, total_zones)
+
+knitr::kable(all_zone_table, align = c("l", "r", "r", "r", "r"))
+```
+
+### Data Lineage & Provenance
+
+The interactive map combines four data sources:
+
+| Dataset / Source | File Path | Content & Purpose in This Map |
+|:---|:---|:---|
+| **EIS Intake Database** | `data/details_all_cases.csv` | Administrative records from the Employment Injury Scheme pilot programme (`r nrow(case_details)` cases). Contains victim demographics (`Gender`, `Age`), employment information (`District (Factory)`, `Designation`), incident reporting date, and outcome (`Loss`: Death or Disability). |
+| **Journey Markers** | `data/points.parquet` | Coordinate points extracted from the case KMZ files. Each journey contains Point A (start), Point B (accident location) and Point C (destination). Only **Point B** coordinates are plotted as accident locations on this map (`r nrow(accidents_plot)` cases). |
+| **Worker Travel Paths** | `data/paths.parquet` | Digitized road and transit path polylines extracted from the case KMZ files, representing the worker's complete journey from origin to destination. Displayed under the **Journey routes** layer. |
+| **OpenStreetMap Network** | `data/osm_roads.gpkg` | Project OpenStreetMap (OSM) extract holding only road pieces close to the accident points. It is not a full road network for Bangladesh. Used to match each accident point to the nearest road, identify road names (e.g. *Dhaka–Chattogram Hwy*) and determine road class (*trunk, primary, secondary, local*). |
+
+### What is "Unknown" & Unmatched?
+
+1. **Accident Type "Unknown" (`r sum(accidents_plot$Type == "Unknown")` cases)**:
+   - When importing raw KMZ records, cases are parsed as `Commuting` or `RTA` (on-duty road traffic accident). The `Unknown` category is a fallback reserved for any case where the accident type was omitted or unclassified in the source records. In the current dataset, the `r nrow(accidents_plot)` mapped cases are classified as `r sum(accidents_plot$Type == "Commuting")` Commuting, `r sum(accidents_plot$Type == "RTA")` RTA and `r sum(accidents_plot$Type == "Unknown")` Unknown.
+2. **Road Status "Unmatched (>50 m)" (`r sum(is.na(accidents_plot$osm_id))` cases)**:
+   - A mapped point is classified as "Unmatched" if its Point B coordinate lies more than 50 metres from every road in the project OpenStreetMap extract. `r sum(is.na(accidents_plot$osm_id) & accidents_plot$Type == "RTA")` of these are RTA records.
+   - **Possible reasons, not confirmed for any point**:
+     - *Gaps in the road extract*: The extract does not cover every point. `r sum(matches$match_distance_m > 1000)` unmatched points lie more than 1 km from any road in it.
+     - *Small or unmapped roads*: Narrow lanes or informal tracks may be missing from OpenStreetMap.
+     - *Mapping error*: The point may be slightly misplaced in the case file.
+   - You can toggle the orange **Unmatched (>50 m)** highlight layer on the map to review these `r sum(is.na(accidents_plot$osm_id))` locations against satellite imagery.
+3. **Intake Cases Without Map Data (`r nrow(case_details) - intake_mapped_n` cases)**:
+   - The EIS intake database contains `r nrow(case_details)` recorded cases, and `r intake_mapped_n` of them have a usable map file. The remaining `r nrow(case_details) - intake_mapped_n` cases count in the gender, age and transport findings of the pilot report, but cannot be shown on this map.
+   - A further `r map_only_n` mapped case files have no intake record, so their popups show `—` for worker details. One case file holds two mapped journeys, so the map shows `r nrow(accidents_plot)` accident points in total.
+4. **Missing Values (`—` in table and popups)**:
+   - In the Case Reference Table and map popups, an em-dash (`—`) indicates an optional attribute (such as victim age or travel mode) that was left blank in the original intake documentation.
+
+---
+
+## Case Reference Table
+
+The table below lists every mapped accident point with key attributes for verification. Use the **Search** box to filter by case ID, district, road, or any other field. Click column headers to sort.
+
+```{r case-table}
+table_df <- accidents_plot |>
+  st_drop_geometry() |>
+  transmute(
+    `Case ID`            = `File ID`,
+    `Type`               = Type,
+    `Zone`               = zone_id,
+    `Zone priority`      = risk_class,
+    `Zone cases`         = zone_count,
+    `District (accident)`= coalesce(`District (Accident)`, "—"),
+    `District (factory)` = coalesce(`District (Factory)`,  "—"),
+    `Loss`               = coalesce(Loss,     "—"),
+    `Gender`             = coalesce(Gender,   "—"),
+    `Age`                = coalesce(as.character(Age), "—"),
+    `Mode`               = coalesce(Mode,     "—"),
+    `Matched road`       = matched_road,
+    `Road match quality` = coalesce(match_confidence, "Unmatched"),
+    `Lat`                = round(lat, 5),
+    `Lon`                = round(lon, 5)
+  ) |>
+  arrange(Zone, `Case ID`)
+
+datatable(
+  table_df,
+  rownames    = FALSE,
+  filter      = "top",
+  extensions  = c("Buttons", "Scroller"),
+  options     = list(
+    dom        = "Bfrtip",
+    buttons    = list(
+      list(extend = "csv",   filename = "eis_accident_locations"),
+      list(extend = "excel", filename = "eis_accident_locations"),
+      "colvis"
+    ),
+    scrollX    = TRUE,
+    scrollY    = "420px",
+    scroller   = TRUE,
+    pageLength = 25,
+    columnDefs = list(
+      list(className = "dt-center", targets = c(2, 3, 4, 5, 13, 14))
+    )
+  ),
+  class = "stripe hover compact"
+) |>
+  formatStyle(
+    "Zone priority",
+    backgroundColor = styleEqual(
+      names(zone_colours),
+      paste0(unname(zone_colours), "33")
+    ),
+    fontWeight = "bold"
+  ) |>
+  formatStyle(
+    "Road match quality",
+    color = styleEqual(
+      c("High", "Lower", "Unmatched"),
+      c("#2E7D32", "#E65100", "#B71C1C")
+    ),
+    fontWeight = "bold"
+  )
+```
+
+---
+
+## How to Use This Map
+
+**Layers panel** (top-right)
+
+| Layer | Default | Purpose |
+|:---|:---:|:---|
+| Priority zones | ✔ On | Colour-coded overlapping buffer zones — click for zone ID and priority |
+| Commuting accidents | ✔ On | Red markers; click for full case detail popup |
+| RTA accidents | ✔ On | Purple markers; click for full case detail popup |
+| Unknown type | ✔ On | Grey markers (only shown if such cases exist) |
+| Journey routes | Off | Worker journey lines — toggle on to see full routes |
+| Unmatched (>50 m) | Off | Orange rings highlight points that could not be linked to a road |
+
+**Verification tips**
+
+- Switch to **Satellite** imagery to check whether a point sits on the correct road or inside a compound.
+- Enable **Unmatched** rings to prioritise coordinates that need review in the original KMZ files.
+- Use the **measure tool** (top-left ruler icon) to check distances between points or from a point to the nearest road.
+- Use the **search box** (top-left magnifier) to jump to any place name.
+- The **Case Reference Table** below the map supports full-text search and can be exported to CSV/Excel.
+
+---
+
+*Generated `r format(Sys.time(), "%d %B %Y %H:%M")` · Zone radius: `r radius_m` m · Data: EIS Pilot Programme*
